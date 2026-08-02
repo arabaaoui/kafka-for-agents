@@ -380,18 +380,34 @@ Both files attach to a shared external network, `kafka-retail-test`, so the app 
 make test-stack   # start the standalone test Kafka cluster (port 9093)
 make app          # start the app services against the test cluster
 make all          # test-stack + app in one go
+make demo-1       # all + run the full pipeline demo
+make demo-2       # horizontal scaling demo (1→5 agents)
+make demo-3       # crash recovery demo
 make logs         # follow app service logs
 make logs-test    # follow Kafka test cluster logs
+make check        # pipeline health: consumer groups, message counts, recent anomalies/tasks
+make monitor      # follow app agent logs + Kafka UI logs together
+make topics       # show topic/partition state via docker exec
+make local-test   # run the local Python deterministic-flow test, no Docker/LLM required
 make stop-app     # stop the app services
 make stop-test    # stop the test Kafka cluster
 make clean        # stop everything and remove the test Kafka volume
-make clean-all     # clean + remove the shared kafka-retail-test network
-make local-test   # run the local Python deterministic-flow test, no Docker/LLM required
-make monitor      # follow app agent logs + Kafka UI logs together
-make topics       # show topic/partition state via docker exec
+make clean-all    # clean + remove the shared kafka-retail-test network
 ```
 
 `make test-stack` creates the `kafka-retail-test` network if it doesn't already exist and prints the Kafka UI URL (http://localhost:8081, on a different port from the main stack's `:8080` to avoid conflicts). This test setup is entirely independent from the main `docker-compose.yml` stack (different Kafka port, different network) — the two can coexist without conflicting.
+
+### Monitoring the pipeline
+
+Kafka UI (`http://localhost:8081`) gives you real-time visibility into topics, messages, and consumer groups. For command-line checks:
+
+```bash
+make check     # consumer groups state, message counts per topic, recent anomalies/tasks
+make logs      # live agent output: [DETECTION], [DECISION], [EXECUTION]
+make topics    # partition layout and replication for each topic
+```
+
+A healthy pipeline shows messages flowing through all 5 topics (`stocks` → `anomalies` → `tasks`/`audit`) with consumer group lags staying near zero.
 
 ---
 
