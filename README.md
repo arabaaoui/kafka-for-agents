@@ -103,7 +103,7 @@ flowchart TB
 
     subgraph EXE["Execution Agent ×N (KIP-932 share group)"]
         direction TB
-        EXE_ADK["google-adk Agent (optional)<br/>EXECUTION_LLM_*"]
+        EXE_ADK["google-adk Agent<br/>EXECUTION_LLM_*"]
         EXE_DET["Deterministic fallback<br/>fixed 2s, 100% success"]
     end
 
@@ -196,7 +196,7 @@ sequenceDiagram
 sequenceDiagram
     participant SG as ShareGroupClient (KIP-932)
     participant P as Python loop
-    participant A as ADK Agent (EXECUTION_LLM, optional)
+    participant A as ADK Agent (EXECUTION_LLM)
 
     SG->>P: poll() → acquired task (locked)
     P->>SG: acknowledge(RENEW) — extend lock immediately
@@ -234,18 +234,21 @@ The Decision Agent's behavior is driven by a plain-text [`SKILL.md`](skills/supp
 
 ### 3. KIP-932 Share Groups — Cooperative Consumption with ACK/Retry
 
-Execution agents use [KIP-932](https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka) share groups (emulated in [`share_group_client.py`](agents/common/share_group_client.py) since Python's `confluent-kafka` doesn't yet expose a native `KafkaShareConsumer`):
+Execution agents consume the `tasks` topic using [KIP-932](https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka) share group semantics. The Python library `confluent-kafka` doesn't expose a native `KafkaShareConsumer` yet (the protocol is implemented at broker level in Kafka 4.x, but the Python client hasn't caught up), so [`share_group_client.py`](agents/common/share_group_client.py) wraps a standard `Consumer` with an **application-layer emulation** of the KIP-932 state machine — per-message locks, ACK/RENEW/RELEASE lifecycle, lock expiry, and dead-letter after max delivery attempts:
 
-- **Cooperative consumption**: tasks are load-balanced across all agents — each task delivered to exactly one agent
-- **ACK-based delivery**: tasks are only marked complete when the agent acknowledges — no data loss on crashes
-- **Auto-reassignment**: if an agent dies, its unacknowledged tasks are automatically reassigned to healthy agents after lock expiry
-- **Linear scalability**: `docker compose up -d --scale execution-agent=N` — add capacity instantly
+- **Cooperative consumption**: partitions are distributed by Kafka's native consumer group protocol; the emulation adds per-message locking on top so tasks aren't processed by two agents simultaneously
+- **ACK-based delivery**: tasks are only marked complete when the agent calls `acknowledge(ACK)` — the standard consumer offset is committed only then
+- **Auto-reassignment**: if an agent crashes without ACKing, the lock expires (30s default) and the message becomes `AVAILABLE` again for any agent in the group
+- **Dead-letter**: after `max_delivery_attempts` failed deliveries, the task is silently dropped with a log warning
+- **Linear scalability**: `docker compose up -d --scale execution-agent=N` — new agents join the consumer group and immediately receive partitions
+
+The day `confluent-kafka` ships `KafkaShareConsumer`, the emulation layer can be swapped for the native implementation — the public API (`poll()`, `acknowledge()`) stays identical.
 
 ---
 
 ## Real ADK agents, one LLM provider per agent
 
-Every agent (`detection`, `decision`, and optionally `execution`) is a real `google.adk.Agent` run through a `google.adk.Runner` — never a hand-rolled HTTP call to a provider API. [`agents/common/adk_factory.py`](agents/common/adk_factory.py) builds the model for any of the three agents from **three independent env var blocks**, so each agent can use a different provider and model:
+Every agent (`detection`, `decision`, and `execution`) is a real `google.adk.Agent` run through a `google.adk.Runner` — never a hand-rolled HTTP call to a provider API. [`agents/common/adk_factory.py`](agents/common/adk_factory.py) builds the model for any of the three agents from **three independent env var blocks**, so each agent can use a different provider and model:
 
 ```python
 def create_llm(provider: str, model: str, api_key: str):
