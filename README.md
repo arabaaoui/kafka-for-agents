@@ -236,7 +236,7 @@ This keeps the demo runnable end-to-end without paying for any LLM provider, and
 
 ```bash
 # 1. Clone the repository
-git clone <repo-url> kafka-retail-agents-poc
+git clone https://github.com/arabaaoui/kafka-for-agents.git kafka-retail-agents-poc
 cd kafka-retail-agents-poc
 
 # 2. Create your environment file
@@ -321,6 +321,7 @@ make stop-app     # stop the app services
 make stop-test    # stop the test Kafka cluster
 make clean        # stop everything and remove the test Kafka volume
 make clean-all     # clean + remove the shared kafka-retail-test network
+make local-test   # run the local Python deterministic-flow test, no Docker/LLM required
 ```
 
 `make test-stack` creates the `kafka-retail-test` network if it doesn't already exist. This test setup is entirely independent from the main `docker-compose.yml` stack (different Kafka port, different network) — the two can coexist without conflicting.
@@ -333,6 +334,9 @@ make clean-all     # clean + remove the shared kafka-retail-test network
 kafka-retail-agents-poc/
 ├── .env.example                      # Environment variable template (3 LLM blocks)
 ├── docker-compose.yml                # Complete stack definition
+├── docker-compose.test.yml           # Standalone test Kafka cluster (port 9093)
+├── docker-compose.app.yml            # App services only, connects to the test cluster
+├── Makefile                          # Dev workflow targets (test-stack, app, local-test, ...)
 ├── PLAN.md                           # Implementation plan / design notes
 ├── scripts/
 │   ├── demo-1-full-pipeline.sh       # Full pipeline startup demo
@@ -345,6 +349,8 @@ kafka-retail-agents-poc/
 │   ├── Dockerfile
 │   ├── package.json
 │   └── server.js                     # MCP server exposing Kafka tools (KafkaJS)
+├── tests/
+│   └── test_deterministic_flow.py    # Local test of the deterministic flow, no Docker/LLM
 └── agents/
     ├── Dockerfile.agent              # Shared image for simulator + 3 agents
     ├── common/
