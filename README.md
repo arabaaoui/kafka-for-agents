@@ -199,15 +199,15 @@ def create_llm(provider: str, model: str, api_key: str):
 All three providers are routed through [LiteLLM](https://docs.litellm.ai/) — there's no provider-specific SDK wiring, no separate `AnthropicLlm`/`Claude` branch, and no OpenAI-only payload assumption baked into the code.
 
 ```env
-# Detection Agent
+# Detection Agent — OPTIONAL
 DETECTION_LLM_PROVIDER=openai
 DETECTION_LLM_MODEL=gpt-4o
-DETECTION_LLM_API_KEY=sk-...
+DETECTION_LLM_API_KEY=          # empty = deterministic, no LLM call at all
 
-# Decision Agent
+# Decision Agent — OPTIONAL
 DECISION_LLM_PROVIDER=anthropic
 DECISION_LLM_MODEL=claude-sonnet-4-20250514
-DECISION_LLM_API_KEY=sk-ant-...
+DECISION_LLM_API_KEY=           # empty = deterministic, no LLM call at all
 
 # Execution Agent — OPTIONAL
 EXECUTION_LLM_PROVIDER=gemini
@@ -215,7 +215,13 @@ EXECUTION_LLM_MODEL=gemini-2.5-pro
 EXECUTION_LLM_API_KEY=          # empty = deterministic, no LLM call at all
 ```
 
-**Execution without an LLM key** doesn't fall back to a random simulation — it's a fully deterministic path: fixed 2-second delay, 100% success, zero randomness. That keeps the demo runnable end-to-end with just two LLM keys (Detection + Decision) if you don't want to pay for a third provider.
+**All three agents are runnable with zero LLM keys.** Each one follows the same principle: if its `*_LLM_API_KEY` is empty, no `AdkAgentRunner` is ever instantiated — the agent falls back to a fixed, deterministic path instead of calling out to a provider:
+
+- **Detection without a key**: the deterministic pre-filter (`quantity < seuil_min`) still runs on every stock message. Each candidate is published straight to `anomalies` as a basic, unqualified anomaly (`type_anomalie=rupture_stock`, `severity=WARNING`) — no LLM severity qualification.
+- **Decision without a key**: every anomaly gets the default rule-based outcome — a supplier order (`commande_fournisseur`) sized off `seuil_min`/`current_quantity`, published as a task plus an audit log entry with `raison` explaining it's a deterministic fallback.
+- **Execution without a key**: fully deterministic — fixed 2-second delay, 100% success, zero randomness.
+
+This keeps the demo runnable end-to-end without paying for any LLM provider, and you can enable qualification/reasoning selectively per agent by setting only the keys you want.
 
 ---
 
@@ -224,7 +230,7 @@ EXECUTION_LLM_API_KEY=          # empty = deterministic, no LLM call at all
 ### Prerequisites
 
 - Docker & Docker Compose v2
-- At least two LLM API keys (Detection + Decision are required; Execution is optional)
+- LLM API keys are optional for all three agents — leave any `*_LLM_API_KEY` empty to run that agent on its deterministic fallback instead
 
 ### Setup
 
@@ -236,7 +242,8 @@ cd kafka-retail-agents-poc
 # 2. Create your environment file
 cp .env.example .env
 
-# 3. Edit .env — set DETECTION_LLM_API_KEY and DECISION_LLM_API_KEY at minimum
+# 3. Edit .env — set any/all of DETECTION_LLM_API_KEY, DECISION_LLM_API_KEY,
+#    EXECUTION_LLM_API_KEY (all optional; empty = deterministic fallback)
 vim .env
 
 # 4. Start the full pipeline
@@ -366,10 +373,10 @@ kafka-retail-agents-poc/
 |----------|----------|---------|-------------|
 | `DETECTION_LLM_PROVIDER` | No | `openai` | `openai` \| `anthropic` \| `gemini` |
 | `DETECTION_LLM_MODEL` | No | `gpt-4o` | Model name |
-| `DETECTION_LLM_API_KEY` | **Yes** | — | API key for the Detection Agent |
+| `DETECTION_LLM_API_KEY` | No | *(empty)* | Leave empty for deterministic detection (basic anomaly, no severity qualification) |
 | `DECISION_LLM_PROVIDER` | No | `anthropic` | `openai` \| `anthropic` \| `gemini` |
 | `DECISION_LLM_MODEL` | No | `claude-sonnet-4-20250514` | Model name |
-| `DECISION_LLM_API_KEY` | **Yes** | — | API key for the Decision Agent |
+| `DECISION_LLM_API_KEY` | No | *(empty)* | Leave empty for deterministic decision (default supplier order) |
 | `EXECUTION_LLM_PROVIDER` | No | *(empty)* | `openai` \| `anthropic` \| `gemini` |
 | `EXECUTION_LLM_MODEL` | No | *(empty)* | Model name |
 | `EXECUTION_LLM_API_KEY` | No | *(empty)* | Leave empty for deterministic execution (fixed 2s, 100% success) |

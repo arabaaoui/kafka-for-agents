@@ -7,6 +7,11 @@ worth escalating — the simulator produces ~10,000 stock messages per cycle
 both slow and needlessly expensive. Only pre-filtered candidates go through
 the real google-adk Agent, which qualifies severity and publishes the anomaly
 itself via its `produce_anomaly` tool.
+
+The detection LLM is OPTIONAL, same principle as the Execution agent. If
+DETECTION_LLM_API_KEY is empty, no ADK agent is ever instantiated: each
+pre-filtered candidate is published straight to 'anomalies' as a basic,
+unqualified anomaly (see `produce_simple_anomaly`) — no severity qualification.
 """
 
 import json
@@ -57,6 +62,37 @@ def is_anomaly(stock_msg: dict) -> bool:
     quantity = stock_msg.get("quantity", 0)
     seuil_min = stock_msg.get("seuil_min", 0)
     return quantity < seuil_min
+
+
+def produce_simple_anomaly(producer: Producer, stock_data: dict) -> None:
+    """No-LLM detection path: publish the pre-filtered candidate as-is, no severity qualification."""
+    store_id = stock_data.get("store_id")
+    product_id = stock_data.get("product_id")
+    quantity = stock_data.get("quantity", 0)
+    seuil_min = stock_data.get("seuil_min", 0)
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    anomaly = {
+        "anomalie_id": f"anomaly-{product_id}-{store_id}-{timestamp}",
+        "timestamp": timestamp,
+        "type_anomalie": "rupture_stock",
+        "severity": "WARNING",
+        "store_id": store_id,
+        "product_id": product_id,
+        "region": stock_data.get("region"),
+        "current_quantity": quantity,
+        "seuil_min": seuil_min,
+        "message": f"Stock bas détecté (qty={quantity} < seuil={seuil_min})",
+    }
+    anomaly_json_str = json.dumps(anomaly, ensure_ascii=False)
+    producer.produce(
+        TOPIC_ANOMALIES,
+        key=str(store_id),
+        value=anomaly_json_str.encode("utf-8"),
+        on_delivery=lambda err, msg: logger.error(f"Delivery failed: {err}") if err else None,
+    )
+    producer.flush(timeout=5)
+    logger.info(f"Anomaly produced (deterministic): {anomaly['anomalie_id']}")
 
 
 class DetectionTools:
@@ -130,18 +166,22 @@ def main():
     producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS})
 
     tools = DetectionTools(producer)
-    agent_runner = AdkAgentRunner(
-        name="detection-agent",
-        description="Détecte et qualifie les anomalies de stock (rupture, stock critique, stock zéro).",
-        instruction=SYSTEM_PROMPT,
-        tools=[tools.consume_stocks, tools.call_mcp, tools.produce_anomaly],
-        provider=DETECTION_LLM_PROVIDER,
-        model=DETECTION_LLM_MODEL,
-        api_key=DETECTION_LLM_API_KEY,
-    )
+    agent_runner = None
+    if DETECTION_LLM_API_KEY:
+        agent_runner = AdkAgentRunner(
+            name="detection-agent",
+            description="Détecte et qualifie les anomalies de stock (rupture, stock critique, stock zéro).",
+            instruction=SYSTEM_PROMPT,
+            tools=[tools.consume_stocks, tools.call_mcp, tools.produce_anomaly],
+            provider=DETECTION_LLM_PROVIDER,
+            model=DETECTION_LLM_MODEL,
+            api_key=DETECTION_LLM_API_KEY,
+        )
+        logger.info(f"LLM: provider={DETECTION_LLM_PROVIDER} model={DETECTION_LLM_MODEL}")
+    else:
+        logger.info("No DETECTION_LLM_API_KEY configured — running deterministic anomaly detection")
 
     logger.info(f"Detection agent started. Listening on topic '{TOPIC_STOCKS}'")
-    logger.info(f"LLM: provider={DETECTION_LLM_PROVIDER} model={DETECTION_LLM_MODEL}")
 
     try:
         while not shutdown_event:
@@ -178,20 +218,22 @@ def main():
                 f"qty={stock_data.get('quantity')} < seuil_min={stock_data.get('seuil_min')}"
             )
 
-            user_prompt = DETECTION_USER_PROMPT.format(
-                store_id=stock_data.get("store_id"),
-                product_id=stock_data.get("product_id"),
-                quantity=stock_data.get("quantity"),
-                seuil_min=stock_data.get("seuil_min"),
-                region=stock_data.get("region"),
-                timestamp=stock_data.get("timestamp"),
-            )
-
-            try:
-                response = agent_runner.run(user_prompt)
-                logger.info(f"Agent response: {response}")
-            except Exception as e:
-                logger.error(f"Detection agent LLM call failed: {e}")
+            if agent_runner is not None:
+                user_prompt = DETECTION_USER_PROMPT.format(
+                    store_id=stock_data.get("store_id"),
+                    product_id=stock_data.get("product_id"),
+                    quantity=stock_data.get("quantity"),
+                    seuil_min=stock_data.get("seuil_min"),
+                    region=stock_data.get("region"),
+                    timestamp=stock_data.get("timestamp"),
+                )
+                try:
+                    response = agent_runner.run(user_prompt)
+                    logger.info(f"Agent response: {response}")
+                except Exception as e:
+                    logger.error(f"Detection agent LLM call failed: {e}")
+            else:
+                produce_simple_anomaly(producer, stock_data)
 
             time.sleep(5)
 

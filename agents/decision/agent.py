@@ -7,6 +7,12 @@ tools (get_neighbor_stocks, produce_task, log_audit) — the Python loop only
 drives Kafka polling and provides a deterministic fallback decision if the LLM
 call fails or the agent forgets to produce a task, so the demo pipeline never
 stalls on an LLM outage.
+
+The decision LLM is OPTIONAL, same principle as the Execution agent. If
+DECISION_LLM_API_KEY is empty, no ADK agent is ever instantiated: every
+anomaly goes straight through `fallback_decision`/`fallback_audit` — the
+default rule-based outcome (commande fournisseur) — reusing the exact same
+fallback path already used when the LLM fails or forgets to produce a task.
 """
 
 import json
@@ -217,19 +223,23 @@ def main():
     producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS})
 
     tools = DecisionTools(producer, stocks_consumer, skill_content)
-    instruction = SYSTEM_PROMPT.format(skill_content=skill_content)
-    agent_runner = AdkAgentRunner(
-        name="decision-agent",
-        description="Décide entre transfert interne et commande fournisseur en appliquant SKILL.md.",
-        instruction=instruction,
-        tools=[tools.read_skill, tools.get_neighbor_stocks, tools.produce_task, tools.log_audit],
-        provider=DECISION_LLM_PROVIDER,
-        model=DECISION_LLM_MODEL,
-        api_key=DECISION_LLM_API_KEY,
-    )
+    agent_runner = None
+    if DECISION_LLM_API_KEY:
+        instruction = SYSTEM_PROMPT.format(skill_content=skill_content)
+        agent_runner = AdkAgentRunner(
+            name="decision-agent",
+            description="Décide entre transfert interne et commande fournisseur en appliquant SKILL.md.",
+            instruction=instruction,
+            tools=[tools.read_skill, tools.get_neighbor_stocks, tools.produce_task, tools.log_audit],
+            provider=DECISION_LLM_PROVIDER,
+            model=DECISION_LLM_MODEL,
+            api_key=DECISION_LLM_API_KEY,
+        )
+        logger.info(f"LLM: provider={DECISION_LLM_PROVIDER} model={DECISION_LLM_MODEL}")
+    else:
+        logger.info("No DECISION_LLM_API_KEY configured — running deterministic decision (commande fournisseur par défaut)")
 
     logger.info(f"Decision agent started. Listening on topic '{TOPIC_ANOMALIES}'")
-    logger.info(f"LLM: provider={DECISION_LLM_PROVIDER} model={DECISION_LLM_MODEL}")
 
     try:
         while not shutdown_event:
@@ -262,22 +272,22 @@ def main():
             )
 
             tools.reset()
-            user_prompt = DECISION_USER_PROMPT.format(
-                anomalie_id=anomaly.get("anomalie_id", ""),
-                store_id=anomaly.get("store_id", ""),
-                product_id=anomaly.get("product_id", ""),
-                region=anomaly.get("region", ""),
-                current_quantity=anomaly.get("current_quantity", 0),
-                seuil_min=anomaly.get("seuil_min", 0),
-                type_anomalie=anomaly.get("type_anomalie", "UNKNOWN"),
-                severite=anomaly.get("severite", "UNKNOWN"),
-            )
-
-            try:
-                response = agent_runner.run(user_prompt)
-                logger.info(f"Agent response: {response}")
-            except Exception as e:
-                logger.error(f"Decision agent LLM call failed: {e}")
+            if agent_runner is not None:
+                user_prompt = DECISION_USER_PROMPT.format(
+                    anomalie_id=anomaly.get("anomalie_id", ""),
+                    store_id=anomaly.get("store_id", ""),
+                    product_id=anomaly.get("product_id", ""),
+                    region=anomaly.get("region", ""),
+                    current_quantity=anomaly.get("current_quantity", 0),
+                    seuil_min=anomaly.get("seuil_min", 0),
+                    type_anomalie=anomaly.get("type_anomalie", "UNKNOWN"),
+                    severite=anomaly.get("severite", "UNKNOWN"),
+                )
+                try:
+                    response = agent_runner.run(user_prompt)
+                    logger.info(f"Agent response: {response}")
+                except Exception as e:
+                    logger.error(f"Decision agent LLM call failed: {e}")
 
             # Guarantee a task always gets produced, even if the LLM failed
             # or forgot to call its tools.
