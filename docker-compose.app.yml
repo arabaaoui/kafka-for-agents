@@ -49,6 +49,7 @@ services:
       DETECTION_LLM_PROVIDER: ${DETECTION_LLM_PROVIDER:-openai}
       DETECTION_LLM_MODEL: ${DETECTION_LLM_MODEL:-gpt-4o}
       DETECTION_LLM_API_KEY: ${DETECTION_LLM_API_KEY}
+      STOCK_ALERT_THRESHOLD_RATIO: ${STOCK_ALERT_THRESHOLD_RATIO:-1.0}
     depends_on:
       mcp-confluent:
         condition: service_started

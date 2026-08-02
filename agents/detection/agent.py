@@ -31,6 +31,7 @@ from common.config import (
     DETECTION_LLM_PROVIDER,
     DETECTION_LLM_MODEL,
     DETECTION_LLM_API_KEY,
+    STOCK_ALERT_THRESHOLD_RATIO,
 )
 from common.adk_factory import AdkAgentRunner
 from detection.prompts import SYSTEM_PROMPT, DETECTION_USER_PROMPT
@@ -58,10 +59,10 @@ signal.signal(signal.SIGINT, handle_sigterm)
 
 
 def is_anomaly(stock_msg: dict) -> bool:
-    """Deterministic pre-filter: quantity < seuil_min. Runs BEFORE the LLM is invoked."""
+    """Deterministic pre-filter: quantity < seuil_min * STOCK_ALERT_THRESHOLD_RATIO. Runs BEFORE the LLM is invoked."""
     quantity = stock_msg.get("quantity", 0)
     seuil_min = stock_msg.get("seuil_min", 0)
-    return quantity < seuil_min
+    return quantity < seuil_min * STOCK_ALERT_THRESHOLD_RATIO
 
 
 def produce_simple_anomaly(producer: Producer, stock_data: dict) -> None:

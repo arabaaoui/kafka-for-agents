@@ -11,6 +11,68 @@ A proof-of-concept demonstrating how **Apache Kafka can serve as a native platfo
 
 ---
 
+## Use Case: Retail Replenishment Pipeline
+
+A distributor operates **200 stores** across multiple regions, each carrying up to **50 products**. Every product has a **minimum stock threshold** (`seuil_min`) per store — below this level, the shelf risks going empty before the next delivery window.
+
+When stock dips below the threshold, the system must detect the anomaly, decide whether to **transfer inventory from a neighboring store** (faster, cheaper) or **place a supplier order** (slower, higher volume), execute the task, and log everything for audit.
+
+### Business Flow
+
+```mermaid
+flowchart TB
+    STORE["🏪 Store<br/>Paris-14<br/>Product P-42: 5 units<br/>Threshold: 20"]
+
+    STORE --> DETECT{"Stock < seuil_min ?<br/>5 < 20 → YES"}
+    DETECT --> ANOMALY["🚨 ANOMALY<br/>Rupture risk detected"]
+
+    ANOMALY --> CHECK["🔍 Check neighbor stores<br/>Paris-15: 35 units ✓"]
+
+    CHECK --> DECIDE{"Enough<br/>at neighbor?"}
+    DECIDE -->|Yes| TRANSFER["📦 TRANSFER<br/>15 units<br/>Paris-15 → Paris-14"]
+    DECIDE -->|No| ORDER["🏭 ORDER<br/>Supplier order<br/>(seuil_min − stock + buffer)"]
+
+    TRANSFER --> EXECUTE["⚙️ EXECUTE<br/>Transfer confirmed"]
+    ORDER --> EXECUTE
+
+    EXECUTE --> AUDIT["📋 AUDIT<br/>Operation logged"]
+```
+
+### Functional Walkthrough
+
+```mermaid
+sequenceDiagram
+    participant M as 🏪 Paris-14
+    participant D as 🚨 Détection
+    participant C as 🔍 Consultation
+    participant DEC as 🧠 Décision
+    participant E as ⚙️ Exécution
+    participant A as 📋 Audit
+
+    M->>D: Stock P-42 = 5, seuil = 20
+    D->>D: 5 < 20 → ANOMALY
+    D->>DEC: Anomaly: product=P-42, store=Paris-14
+    DEC->>C: Check neighbor stores in same region
+    C-->>DEC: Paris-15: 35 units available
+    DEC->>DEC: Transfer possible → 15 units
+    DEC->>E: Task: transfert_interne, 15 units, Paris-15→Paris-14
+    DEC->>A: Log: decision=transfert_interne, reason=neighbor surplus
+    E->>E: Execute transfer (2s, success)
+    E->>A: Log: task completed
+```
+
+**Key business rules** (defined in [`SKILL.md`](skills/supply-chain-replenishment/SKILL.md)):
+1. Identify the product and store from the anomaly
+2. Check stock levels at neighboring stores in the same region
+3. If a neighbor has enough surplus → **internal transfer** (avoid supplier cost + delay)
+4. If no neighbor can help → **supplier order** (quantity = seuil_min − current stock + 10% buffer)
+5. For perishable products, add an extra 10% buffer for waste
+6. Log every decision to the audit topic for traceability
+
+The **detection threshold** is configurable via `STOCK_ALERT_THRESHOLD_RATIO` (default: 1.0). Setting it to 0.8 means the alert fires when stock falls below 80% of the product's `seuil_min` — useful for early-warning scenarios.
+
+---
+
 ## Architecture
 
 ```mermaid
@@ -304,8 +366,8 @@ For local development, the stack can be split into two independent Compose files
 
 | File | Contains | Kafka port |
 |------|----------|------------|
-| `docker-compose.test.yml` | Standalone Kafka 4.2.1 (KRaft, 1 broker) + topic init (`orders`, `stocks`, `anomalies`, `tasks`, `audit`) | `9093` |
-| `docker-compose.app.yml` | `mcp-confluent`, `simulator`, `detection-agent`, `decision-agent`, `execution-agent` (no Kafka, no Kafka UI) | — (connects to `kafka:9093`) |
+| `docker-compose.test.yml` | Standalone Kafka 4.2.1 (KRaft, 1 broker) + topic init (`orders`, `stocks`, `anomalies`, `tasks`, `audit`) + Kafka UI (`:8081`) + `kcat` one-shot topic summary | `9093` |
+| `docker-compose.app.yml` | `mcp-confluent`, `simulator`, `detection-agent`, `decision-agent`, `execution-agent` (no Kafka) | — (connects to `kafka:9093`) |
 
 Both files attach to a shared external network, `kafka-retail-test`, so the app services resolve the test broker by its service name (`kafka`).
 
@@ -322,9 +384,11 @@ make stop-test    # stop the test Kafka cluster
 make clean        # stop everything and remove the test Kafka volume
 make clean-all     # clean + remove the shared kafka-retail-test network
 make local-test   # run the local Python deterministic-flow test, no Docker/LLM required
+make monitor      # follow app agent logs + Kafka UI logs together
+make topics       # show topic/partition state via docker exec
 ```
 
-`make test-stack` creates the `kafka-retail-test` network if it doesn't already exist. This test setup is entirely independent from the main `docker-compose.yml` stack (different Kafka port, different network) — the two can coexist without conflicting.
+`make test-stack` creates the `kafka-retail-test` network if it doesn't already exist and prints the Kafka UI URL (http://localhost:8081, on a different port from the main stack's `:8080` to avoid conflicts). This test setup is entirely independent from the main `docker-compose.yml` stack (different Kafka port, different network) — the two can coexist without conflicting.
 
 ---
 
@@ -391,6 +455,7 @@ kafka-retail-agents-poc/
 | `SHARE_GROUP_LOCK_DURATION_MS` | No | `30000` | KIP-932 lock duration before a task is redelivered |
 | `SHARE_GROUP_MAX_DELIVERY_ATTEMPTS` | No | `5` | Attempts before a task is dead-lettered |
 | `SIMULATION_SPEED` | No | `1.0` | `1.0` = real-time, `60.0` = 1h of data in 1 minute |
+| `STOCK_ALERT_THRESHOLD_RATIO` | No | `1.0` | Ratio applied to each product's `seuil_min` to decide when it's an anomaly. `1.0` = alert exactly at `seuil_min`, `0.8` = alert only once stock < 80% of `seuil_min` |
 
 ---
 

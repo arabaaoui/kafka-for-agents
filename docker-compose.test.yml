@@ -34,6 +34,40 @@ services:
       retries: 5
 
   # ===========================================================================
+  # Kafka UI — Web dashboard (port 8081 to avoid clashing with the main stack)
+  # ===========================================================================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui-test
+    ports:
+      - "8081:8080"
+    networks:
+      - kafka-retail-test
+    environment:
+      KAFKA_CLUSTERS_0_NAME: retail-test-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9093
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ===========================================================================
+  # kcat — One-shot topic summary, printed once the broker is ready
+  # ===========================================================================
+  kcat:
+    image: edenhill/kcat:latest
+    container_name: kcat-test
+    networks:
+      - kafka-retail-test
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "=== Topic summary (kafka:9093) ===" &&
+        kcat -b kafka:9093 -L
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+
+  # ===========================================================================
   # Topic initializer — Creates test topics on startup
   # ===========================================================================
   kafka-init:

@@ -43,6 +43,9 @@ SHARE_GROUP_MAX_DELIVERY_ATTEMPTS = int(os.getenv("SHARE_GROUP_MAX_DELIVERY_ATTE
 # Simulation
 SIMULATION_SPEED = float(os.getenv("SIMULATION_SPEED", "1.0"))
 
+# Detection threshold — ratio applied to each product's seuil_min (1.0 = exact threshold)
+STOCK_ALERT_THRESHOLD_RATIO = float(os.getenv("STOCK_ALERT_THRESHOLD_RATIO", "1.0"))
+
 # Skill path
 SKILL_PATH = os.getenv("SKILL_PATH", "/app/skills/supply-chain-replenishment/SKILL.md")
 
