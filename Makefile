@@ -1,4 +1,7 @@
-.PHONY: test-stack app all logs logs-test stop-app stop-test clean clean-all
+.PHONY: test-stack app all logs logs-test stop-app stop-test clean clean-all local-test
+
+local-test:
+	python tests/test_deterministic_flow.py
 
 test-stack:
 	docker network create kafka-retail-test 2>/dev/null || true
