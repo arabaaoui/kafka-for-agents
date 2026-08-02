@@ -1,16 +1,17 @@
 """
 Detection Agent — Monitors the 'stocks' topic for anomalies.
 
-For each stock message where quantity < seuil_min, produces an anomaly
-JSON message to the 'anomalies' topic. Uses MCP Confluent via HTTP JSON-RPC
-to consume additional context when needed.
+A deterministic pre-filter (quantity < seuil_min) decides WHETHER a message is
+worth escalating — the simulator produces ~10,000 stock messages per cycle
+(200 stores x 50 products), and calling an LLM on every single one would be
+both slow and needlessly expensive. Only pre-filtered candidates go through
+the real google-adk Agent, which qualifies severity and publishes the anomaly
+itself via its `produce_anomaly` tool.
 """
 
 import json
 import logging
-import os
 import signal
-import sys
 import time
 from datetime import datetime, timezone
 
@@ -22,7 +23,12 @@ from common.config import (
     MCP_CONFLUENT_URL,
     TOPIC_STOCKS,
     TOPIC_ANOMALIES,
+    DETECTION_LLM_PROVIDER,
+    DETECTION_LLM_MODEL,
+    DETECTION_LLM_API_KEY,
 )
+from common.adk_factory import AdkAgentRunner
+from detection.prompts import SYSTEM_PROMPT, DETECTION_USER_PROMPT
 
 # Logging with [DETECTION] prefix
 logging.basicConfig(
@@ -46,86 +52,72 @@ signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
 
 
-def call_mcp_consume(topic: str, limit: int = 10) -> list[dict]:
-    """
-    Call the MCP Confluent server via HTTP POST with JSON-RPC format
-    to consume messages from a topic for additional context.
-    """
-    try:
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "tools/call",
-            "params": {
-                "name": "consume-messages",
-                "arguments": {
-                    "topic": topic,
-                    "max_messages": limit,
-                },
-            },
-            "id": int(time.time() * 1000),
-        }
-
-        with httpx.Client(timeout=30.0) as client:
-            response = client.post(
-                f"{MCP_CONFLUENT_URL}/mcp",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            response.raise_for_status()
-            result = response.json()
-
-            # Extract messages from JSON-RPC response
-            if "result" in result and "content" in result["result"]:
-                content = result["result"]["content"]
-                if isinstance(content, list) and len(content) > 0:
-                    text = content[0].get("text", "[]")
-                    return json.loads(text)
-            return []
-    except Exception as e:
-        logger.warning(f"MCP Confluent call failed: {e}")
-        return []
-
-
 def is_anomaly(stock_msg: dict) -> bool:
-    """Check if a stock message represents an anomaly (quantity < seuil_min)."""
+    """Deterministic pre-filter: quantity < seuil_min. Runs BEFORE the LLM is invoked."""
     quantity = stock_msg.get("quantity", 0)
     seuil_min = stock_msg.get("seuil_min", 0)
     return quantity < seuil_min
 
 
-def build_anomaly_json(stock_msg: dict) -> dict:
-    """Build the anomaly JSON payload from a stock message."""
-    quantity = stock_msg.get("quantity", 0)
-    seuil_min = stock_msg.get("seuil_min", 0)
+class DetectionTools:
+    """Tools exposed to the detection ADK agent. Bound to a live Kafka producer."""
 
-    # Determine severity
-    if quantity == 0:
-        type_anomalie = "STOCK_ZERO"
-        severite = "CRITIQUE"
-    elif quantity < seuil_min * 0.5:
-        type_anomalie = "STOCK_CRITIQUE"
-        severite = "CRITIQUE"
-    else:
-        type_anomalie = "RUPTURE_IMMINENTE"
-        severite = "HAUTE"
+    def __init__(self, producer: Producer):
+        self._producer = producer
 
-    return {
-        "anomalie_id": f"anom-{int(time.time() * 1000000)}",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "store_id": stock_msg.get("store_id"),
-        "product_id": stock_msg.get("product_id"),
-        "region": stock_msg.get("region"),
-        "current_quantity": quantity,
-        "seuil_min": seuil_min,
-        "type_anomalie": type_anomalie,
-        "severite": severite,
-        "stock_message_original": stock_msg,
-    }
+    def consume_stocks(self, limit: int = 5) -> list[dict]:
+        """Read the most recent messages from the 'stocks' Kafka topic via MCP Confluent, for extra context."""
+        return self.call_mcp("consume-messages", {"topic": TOPIC_STOCKS, "max_messages": limit})
+
+    def call_mcp(self, tool_name: str, arguments: dict) -> dict | list:
+        """Call an MCP Confluent tool (consume-messages, list-topics, get-topic-config, get-consumer-group-lag) via HTTP JSON-RPC."""
+        try:
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": arguments},
+                "id": int(time.time() * 1000),
+            }
+            with httpx.Client(timeout=30.0) as client:
+                response = client.post(
+                    f"{MCP_CONFLUENT_URL}/mcp",
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                response.raise_for_status()
+                result = response.json()
+
+                if "result" in result and "content" in result["result"]:
+                    content = result["result"]["content"]
+                    if isinstance(content, list) and len(content) > 0:
+                        return json.loads(content[0].get("text", "{}"))
+                return {}
+        except Exception as e:
+            logger.warning(f"MCP Confluent call failed: {e}")
+            return {}
+
+    def produce_anomaly(self, anomalie_json: str) -> str:
+        """Publish an anomaly JSON payload to the 'anomalies' Kafka topic. Call exactly once per message."""
+        try:
+            anomaly = json.loads(anomalie_json)
+        except json.JSONDecodeError as e:
+            return f"ERROR: invalid JSON — {e}"
+
+        anomaly.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+        anomaly_json_str = json.dumps(anomaly, ensure_ascii=False)
+        self._producer.produce(
+            TOPIC_ANOMALIES,
+            key=str(anomaly.get("store_id")),
+            value=anomaly_json_str.encode("utf-8"),
+            on_delivery=lambda err, msg: logger.error(f"Delivery failed: {err}") if err else None,
+        )
+        self._producer.flush(timeout=5)
+        logger.info(f"Anomaly produced: {anomaly.get('anomalie_id')}")
+        return "OK: anomaly produced"
 
 
 def main():
-    """Main loop — polls 'stocks' topic, detects anomalies, produces to 'anomalies'."""
-    # Kafka consumer for stocks
+    """Main loop — polls 'stocks' topic, pre-filters, delegates qualification+publish to the ADK agent."""
     consumer_conf = {
         "bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS,
         "group.id": "detection-group",
@@ -135,13 +127,21 @@ def main():
     consumer = Consumer(consumer_conf)
     consumer.subscribe([TOPIC_STOCKS])
 
-    # Kafka producer for anomalies
-    producer_conf = {
-        "bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS,
-    }
-    producer = Producer(producer_conf)
+    producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS})
+
+    tools = DetectionTools(producer)
+    agent_runner = AdkAgentRunner(
+        name="detection-agent",
+        description="Détecte et qualifie les anomalies de stock (rupture, stock critique, stock zéro).",
+        instruction=SYSTEM_PROMPT,
+        tools=[tools.consume_stocks, tools.call_mcp, tools.produce_anomaly],
+        provider=DETECTION_LLM_PROVIDER,
+        model=DETECTION_LLM_MODEL,
+        api_key=DETECTION_LLM_API_KEY,
+    )
 
     logger.info(f"Detection agent started. Listening on topic '{TOPIC_STOCKS}'")
+    logger.info(f"LLM: provider={DETECTION_LLM_PROVIDER} model={DETECTION_LLM_MODEL}")
 
     try:
         while not shutdown_event:
@@ -159,7 +159,6 @@ def main():
                 time.sleep(5)
                 continue
 
-            # Parse the stock message
             try:
                 value = msg.value()
                 if value is None:
@@ -169,45 +168,31 @@ def main():
                 logger.error(f"Failed to parse stock message: {e}")
                 continue
 
-            logger.debug(
-                f"Received stock: store={stock_data.get('store_id')} "
+            if not is_anomaly(stock_data):
+                time.sleep(5)
+                continue
+
+            logger.warning(
+                f"Candidate anomaly: store={stock_data.get('store_id')} "
                 f"product={stock_data.get('product_id')} "
-                f"qty={stock_data.get('quantity')}"
+                f"qty={stock_data.get('quantity')} < seuil_min={stock_data.get('seuil_min')}"
             )
 
-            # Check for anomaly
-            if is_anomaly(stock_data):
-                logger.warning(
-                    f"Anomaly detected: store={stock_data.get('store_id')} "
-                    f"product={stock_data.get('product_id')} "
-                    f"qty={stock_data.get('quantity')} < seuil_min={stock_data.get('seuil_min')}"
-                )
+            user_prompt = DETECTION_USER_PROMPT.format(
+                store_id=stock_data.get("store_id"),
+                product_id=stock_data.get("product_id"),
+                quantity=stock_data.get("quantity"),
+                seuil_min=stock_data.get("seuil_min"),
+                region=stock_data.get("region"),
+                timestamp=stock_data.get("timestamp"),
+            )
 
-                # Build anomaly message
-                anomaly = build_anomaly_json(stock_data)
+            try:
+                response = agent_runner.run(user_prompt)
+                logger.info(f"Agent response: {response}")
+            except Exception as e:
+                logger.error(f"Detection agent LLM call failed: {e}")
 
-                # Optionally enrich with MCP Confluent context
-                try:
-                    extra_context = call_mcp_consume(TOPIC_STOCKS, limit=5)
-                    if extra_context:
-                        anomaly["contexte_mcp"] = extra_context
-                except Exception:
-                    pass  # MCP is best-effort
-
-                # Produce to anomalies topic
-                anomaly_json = json.dumps(anomaly, ensure_ascii=False)
-                producer.produce(
-                    TOPIC_ANOMALIES,
-                    key=str(anomaly.get("store_id")),
-                    value=anomaly_json.encode("utf-8"),
-                    on_delivery=lambda err, msg: logger.error(f"Delivery failed: {err}")
-                    if err
-                    else None,
-                )
-                producer.flush(timeout=5)
-                logger.info(f"Anomaly produced: {anomaly['anomalie_id']}")
-
-            # Sleep between polls
             time.sleep(5)
 
     except Exception as e:

@@ -111,9 +111,9 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       MCP_CONFLUENT_URL: http://mcp-confluent:3000
-      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
-      LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-20250514}
-      LLM_API_KEY: ${LLM_API_KEY}
+      DETECTION_LLM_PROVIDER: ${DETECTION_LLM_PROVIDER:-openai}
+      DETECTION_LLM_MODEL: ${DETECTION_LLM_MODEL:-gpt-4o}
+      DETECTION_LLM_API_KEY: ${DETECTION_LLM_API_KEY}
     depends_on:
       mcp-confluent:
         condition: service_started
@@ -135,9 +135,9 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       SKILL_PATH: /app/skills/supply-chain-replenishment/SKILL.md
-      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
-      LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-20250514}
-      LLM_API_KEY: ${LLM_API_KEY}
+      DECISION_LLM_PROVIDER: ${DECISION_LLM_PROVIDER:-anthropic}
+      DECISION_LLM_MODEL: ${DECISION_LLM_MODEL:-claude-sonnet-4-20250514}
+      DECISION_LLM_API_KEY: ${DECISION_LLM_API_KEY}
     depends_on:
       kafka-init:
         condition: service_completed_successfully
@@ -157,9 +157,10 @@ services:
       SHARE_GROUP: execution-group
       SHARE_GROUP_LOCK_DURATION_MS: ${SHARE_GROUP_LOCK_DURATION_MS:-30000}
       SHARE_GROUP_MAX_DELIVERY_ATTEMPTS: ${SHARE_GROUP_MAX_DELIVERY_ATTEMPTS:-5}
-      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
-      LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-20250514}
-      LLM_API_KEY: ${LLM_API_KEY}
+      # Optional — leave empty to run this agent fully deterministic (no LLM call).
+      EXECUTION_LLM_PROVIDER: ${EXECUTION_LLM_PROVIDER:-}
+      EXECUTION_LLM_MODEL: ${EXECUTION_LLM_MODEL:-}
+      EXECUTION_LLM_API_KEY: ${EXECUTION_LLM_API_KEY:-}
     depends_on:
       kafka-init:
         condition: service_completed_successfully

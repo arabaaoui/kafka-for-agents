@@ -1,32 +1,35 @@
 """
 Decision Agent — Polls the 'anomalies' topic and decides on replenishment actions.
 
-Reads the SKILL.md procedure, calls an LLM to decide between internal transfer
-or supplier order, produces tasks to 'tasks' topic and logs decisions to 'audit'.
+SKILL.md is read ONCE at startup and injected into the ADK agent's instruction
+(not re-read per message). The agent applies the procedure itself through its
+tools (get_neighbor_stocks, produce_task, log_audit) — the Python loop only
+drives Kafka polling and provides a deterministic fallback decision if the LLM
+call fails or the agent forgets to produce a task, so the demo pipeline never
+stalls on an LLM outage.
 """
 
 import json
 import logging
-import os
 import signal
-import sys
 import time
 from datetime import datetime, timezone
 
-import httpx
 from confluent_kafka import Consumer, Producer, KafkaError
 
 from common.config import (
     KAFKA_BOOTSTRAP_SERVERS,
     SKILL_PATH,
-    LLM_PROVIDER,
-    LLM_MODEL,
-    LLM_API_KEY,
     TOPIC_ANOMALIES,
     TOPIC_TASKS,
     TOPIC_AUDIT,
     TOPIC_STOCKS,
+    DECISION_LLM_PROVIDER,
+    DECISION_LLM_MODEL,
+    DECISION_LLM_API_KEY,
 )
+from common.adk_factory import AdkAgentRunner
+from decision.prompts import SYSTEM_PROMPT, DECISION_USER_PROMPT
 
 # Logging with [DECISION] prefix
 logging.basicConfig(
@@ -65,75 +68,10 @@ def load_skill_file() -> str:
         return ""
 
 
-def call_llm(system_prompt: str, user_prompt: str) -> dict | None:
-    """
-    Call an LLM (OpenAI-compatible API) with the given prompts.
-    Returns the parsed JSON decision or None on failure.
-    """
-    if not LLM_API_KEY:
-        logger.error("LLM_API_KEY not set — cannot call LLM")
-        return None
-
-    # Determine the API endpoint based on provider
-    provider_endpoints = {
-        "anthropic": "https://api.anthropic.com/v1/messages",
-        "openai": "https://api.openai.com/v1/chat/completions",
-        "deepseek": "https://api.deepseek.com/v1/chat/completions",
-    }
-
-    api_url = provider_endpoints.get(LLM_PROVIDER.lower(), "https://api.openai.com/v1/chat/completions")
-
-    try:
-        # Build request for OpenAI-compatible format
-        headers = {
-            "Authorization": f"Bearer {LLM_API_KEY}",
-            "Content-Type": "application/json",
-        }
-
-        payload = {
-            "model": LLM_MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.2,
-            "max_tokens": 2000,
-        }
-
-        with httpx.Client(timeout=60.0) as client:
-            response = client.post(api_url, json=payload, headers=headers)
-            response.raise_for_status()
-            result = response.json()
-
-            # Extract content from response
-            content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-            logger.debug(f"LLM response: {content[:200]}...")
-
-            # Try to parse JSON from response
-            # The LLM might wrap the JSON in markdown code blocks
-            json_start = content.find("{")
-            json_end = content.rfind("}") + 1
-            if json_start >= 0 and json_end > json_start:
-                json_str = content[json_start:json_end]
-                return json.loads(json_str)
-
-            logger.warning(f"Could not extract JSON from LLM response")
-            return None
-
-    except Exception as e:
-        logger.error(f"LLM call failed: {e}")
-        return None
-
-
-def get_neighbor_stocks(consumer: Consumer, region: str, product_id: str, exclude_store: str) -> list[dict]:
-    """
-    Check stock levels at neighboring stores in the same region.
-    Polls recent messages from the 'stocks' topic.
-    """
-    # We poll for recent stock messages and filter by region/product
+def poll_neighbor_stocks(consumer: Consumer, region: str, product_id: str, exclude_store: str) -> list[dict]:
+    """Poll recent messages from the 'stocks' topic and filter by region/product."""
     neighbors = []
     try:
-        # Try to get up to 50 messages quickly
         for _ in range(50):
             msg = consumer.poll(timeout=0.1)
             if msg is None or msg.error():
@@ -153,39 +91,52 @@ def get_neighbor_stocks(consumer: Consumer, region: str, product_id: str, exclud
                 continue
     except Exception as e:
         logger.warning(f"Error polling neighbor stocks: {e}")
-
     return neighbors
 
 
-def build_decision_prompt(anomaly: dict, skill_content: str, neighbors: list[dict]) -> str:
-    """Build the full decision prompt for the LLM."""
-    from .prompts import DECISION_PROMPT_TEMPLATE
-
-    # Format neighbor stocks
-    neighbor_str = json.dumps(neighbors, indent=2, ensure_ascii=False) if neighbors else "[]"
-
-    return DECISION_PROMPT_TEMPLATE.format(
-        anomalie_id=anomaly.get("anomalie_id", ""),
-        store_id=anomaly.get("store_id", ""),
-        product_id=anomaly.get("product_id", ""),
-        region=anomaly.get("region", ""),
-        current_quantity=anomaly.get("current_quantity", 0),
-        seuil_min=anomaly.get("seuil_min", 0),
-        type_anomalie=anomaly.get("type_anomalie", "UNKNOWN"),
-        severite=anomaly.get("severite", "UNKNOWN"),
-        skill_content=skill_content,
-        neighbor_stocks=neighbor_str,
-    )
+def produce_task(producer: Producer, task: dict) -> None:
+    """Produce a task to the tasks topic."""
+    task.setdefault("task_id", f"task-{int(time.time() * 1000000)}")
+    task.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+    task_json = json.dumps(task, ensure_ascii=False)
+    producer.produce(TOPIC_TASKS, key=task["task_id"], value=task_json.encode("utf-8"))
+    logger.info(f"Task produced: {task['task_id']} action={task.get('action')}")
 
 
-def produce_audit_log(producer: Producer, anomaly: dict, decision: dict) -> None:
-    """Log the decision to the audit topic."""
-    audit_msg = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+def produce_audit_log(producer: Producer, audit: dict) -> None:
+    """Log a decision to the audit topic."""
+    audit.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+    audit_json = json.dumps(audit, ensure_ascii=False)
+    producer.produce(TOPIC_AUDIT, key=str(audit.get("anomalie_id")), value=audit_json.encode("utf-8"))
+    logger.info(f"Audit log produced for anomaly {audit.get('anomalie_id')}")
+
+
+def fallback_decision(anomaly: dict) -> dict:
+    """Deterministic fallback if the LLM fails or forgets to call produce_task: default supplier order."""
+    quantite = max(anomaly.get("seuil_min", 10) - anomaly.get("current_quantity", 0) + 5, 1)
+    return {
+        "action": "commande_fournisseur",
+        "magasin_source": None,
+        "magasin_destination": anomaly.get("store_id"),
+        "product_id": anomaly.get("product_id"),
+        "quantite": quantite,
+        "perissable": False,
+        "buffer_gaspillage_pct": None,
+        "priorite": anomaly.get("severite", "HAUTE"),
+        "region": anomaly.get("region"),
+        "delai_estime_heures": 48,
+        "raison": "Fallback : décision automatique suite à échec ou absence de réponse du LLM",
+    }
+
+
+def fallback_audit(anomaly: dict, decision: dict) -> dict:
+    """Build the audit entry matching a fallback (or agent) decision."""
+    type_decision = "COMMANDE_FOURNISSEUR" if decision.get("action") == "commande_fournisseur" else "TRANSFERT_INTERNE"
+    return {
         "anomalie_id": anomaly.get("anomalie_id"),
-        "type_decision": decision.get("decision"),
+        "type_decision": type_decision,
         "product_id": decision.get("product_id"),
-        "store_id": decision.get("store_id") or anomaly.get("store_id"),
+        "store_id": decision.get("magasin_destination") or anomaly.get("store_id"),
         "region": anomaly.get("region"),
         "quantite_commandee": decision.get("quantite"),
         "magasin_source": decision.get("magasin_source"),
@@ -194,63 +145,57 @@ def produce_audit_log(producer: Producer, anomaly: dict, decision: dict) -> None
         "raison": decision.get("raison", ""),
     }
 
-    audit_json = json.dumps(audit_msg, ensure_ascii=False)
-    producer.produce(
-        TOPIC_AUDIT,
-        key=str(anomaly.get("anomalie_id")),
-        value=audit_json.encode("utf-8"),
-    )
-    logger.info(f"Audit log produced for anomaly {anomaly.get('anomalie_id')}")
 
+class DecisionTools:
+    """Tools exposed to the decision ADK agent. Tracks side effects for the fallback logic."""
 
-def produce_task(producer: Producer, decision: dict) -> None:
-    """Produce a task to the tasks topic."""
-    task_msg = {
-        "task_id": f"task-{int(time.time() * 1000000)}",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "action": decision.get("decision", ""),
-        "magasin_source": decision.get("magasin_source"),
-        "magasin_destination": decision.get("magasin_destination"),
-        "product_id": decision.get("product_id"),
-        "quantite": decision.get("quantite"),
-        "perissable": decision.get("perissable", False),
-        "buffer_gaspillage_pct": decision.get("buffer_gaspillage_pct"),
-        "priorite": decision.get("priorite", "HAUTE"),
-        "delai_estime_heures": decision.get("delai_estime_heures"),
-        "raison": decision.get("raison", ""),
-    }
+    def __init__(self, producer: Producer, stocks_consumer: Consumer, skill_content: str):
+        self._producer = producer
+        self._stocks_consumer = stocks_consumer
+        self._skill_content = skill_content
+        self.reset()
 
-    task_json = json.dumps(task_msg, ensure_ascii=False)
-    producer.produce(
-        TOPIC_TASKS,
-        key=task_msg["task_id"],
-        value=task_json.encode("utf-8"),
-    )
-    logger.info(f"Task produced: {task_msg['task_id']} action={task_msg['action']}")
+    def reset(self) -> None:
+        self.task_produced = False
+        self.audit_produced = False
+        self.last_decision: dict | None = None
+
+    def read_skill(self) -> str:
+        """Return the full text of the SKILL.md replenishment procedure."""
+        return self._skill_content
+
+    def get_neighbor_stocks(self, region: str, product_id: str, exclude_store: str) -> list[dict]:
+        """List stock levels for a product across stores in the same region, excluding the anomaly's own store."""
+        return poll_neighbor_stocks(self._stocks_consumer, region, product_id, exclude_store)
+
+    def produce_task(self, task_json: str) -> str:
+        """Publish an execution task (transfert_interne or commande_fournisseur) to the 'tasks' topic."""
+        try:
+            task = json.loads(task_json)
+        except json.JSONDecodeError as e:
+            return f"ERROR: invalid JSON — {e}"
+        produce_task(self._producer, task)
+        self.task_produced = True
+        self.last_decision = task
+        return "OK: task produced"
+
+    def log_audit(self, decision_json: str) -> str:
+        """Publish an audit log entry to the 'audit' topic."""
+        try:
+            audit = json.loads(decision_json)
+        except json.JSONDecodeError as e:
+            return f"ERROR: invalid JSON — {e}"
+        produce_audit_log(self._producer, audit)
+        self.audit_produced = True
+        return "OK: audit produced"
 
 
 def main():
-    """Main loop — polls 'anomalies', decides action, produces tasks and audit logs."""
-    global shutdown_event
-
-    # Load SKILL.md
+    """Main loop — polls 'anomalies', delegates decision to the ADK agent, guarantees task+audit output."""
     skill_content = load_skill_file()
     if not skill_content:
-        logger.warning("SKILL.md is empty or could not be loaded — LLM decisions may be degraded")
+        logger.warning("SKILL.md is empty or could not be loaded — decisions may be degraded")
 
-    # Load system prompt
-    try:
-        from .prompts import SYSTEM_PROMPT
-    except ImportError:
-        SYSTEM_PROMPT_VAR = (
-            "Tu es un agent de décision supply chain. "
-            "Pour chaque anomalie, applique la procédure du fichier SKILL.md."
-        )
-        SYSTEM_PROMPT_VAR = SYSTEM_PROMPT
-    else:
-        SYSTEM_PROMPT_VAR = SYSTEM_PROMPT
-
-    # Kafka consumer for anomalies
     consumer_conf = {
         "bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS,
         "group.id": "decision-group",
@@ -261,23 +206,30 @@ def main():
     consumer.subscribe([TOPIC_ANOMALIES])
 
     # Separate consumer for neighbor stock polling (different group, no offset commit)
-    stocks_consumer_conf = {
+    stocks_consumer = Consumer({
         "bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS,
         "group.id": "decision-stocks-group",
         "auto.offset.reset": "latest",
         "enable.auto.commit": False,
-    }
-    stocks_consumer = Consumer(stocks_consumer_conf)
+    })
     stocks_consumer.subscribe([TOPIC_STOCKS])
 
-    # Kafka producer
-    producer_conf = {
-        "bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS,
-    }
-    producer = Producer(producer_conf)
+    producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS})
+
+    tools = DecisionTools(producer, stocks_consumer, skill_content)
+    instruction = SYSTEM_PROMPT.format(skill_content=skill_content)
+    agent_runner = AdkAgentRunner(
+        name="decision-agent",
+        description="Décide entre transfert interne et commande fournisseur en appliquant SKILL.md.",
+        instruction=instruction,
+        tools=[tools.read_skill, tools.get_neighbor_stocks, tools.produce_task, tools.log_audit],
+        provider=DECISION_LLM_PROVIDER,
+        model=DECISION_LLM_MODEL,
+        api_key=DECISION_LLM_API_KEY,
+    )
 
     logger.info(f"Decision agent started. Listening on topic '{TOPIC_ANOMALIES}'")
-    logger.info(f"SKILL_PATH={SKILL_PATH}, LLM_PROVIDER={LLM_PROVIDER}, LLM_MODEL={LLM_MODEL}")
+    logger.info(f"LLM: provider={DECISION_LLM_PROVIDER} model={DECISION_LLM_MODEL}")
 
     try:
         while not shutdown_event:
@@ -295,7 +247,6 @@ def main():
                 time.sleep(3)
                 continue
 
-            # Parse anomaly message
             try:
                 value = msg.value()
                 if value is None:
@@ -310,44 +261,37 @@ def main():
                 f"store={anomaly.get('store_id')} product={anomaly.get('product_id')}"
             )
 
-            # Get neighbor stocks
-            neighbors = get_neighbor_stocks(
-                stocks_consumer,
-                anomaly.get("region", ""),
-                anomaly.get("product_id", ""),
-                anomaly.get("store_id", ""),
+            tools.reset()
+            user_prompt = DECISION_USER_PROMPT.format(
+                anomalie_id=anomaly.get("anomalie_id", ""),
+                store_id=anomaly.get("store_id", ""),
+                product_id=anomaly.get("product_id", ""),
+                region=anomaly.get("region", ""),
+                current_quantity=anomaly.get("current_quantity", 0),
+                seuil_min=anomaly.get("seuil_min", 0),
+                type_anomalie=anomaly.get("type_anomalie", "UNKNOWN"),
+                severite=anomaly.get("severite", "UNKNOWN"),
             )
-            logger.info(f"Found {len(neighbors)} neighbor(s) in region {anomaly.get('region')}")
 
-            # Build prompt and call LLM
-            user_prompt = build_decision_prompt(anomaly, skill_content, neighbors)
-            decision = call_llm(SYSTEM_PROMPT_VAR, user_prompt)
+            try:
+                response = agent_runner.run(user_prompt)
+                logger.info(f"Agent response: {response}")
+            except Exception as e:
+                logger.error(f"Decision agent LLM call failed: {e}")
 
-            if decision is None:
-                # Fallback: if LLM fails, create a default supplier order
-                logger.warning("LLM failed — using fallback decision (supplier order)")
-                decision = {
-                    "decision": "COMMANDE_FOURNISSEUR",
-                    "magasin_source": None,
-                    "magasin_destination": anomaly.get("store_id"),
-                    "product_id": anomaly.get("product_id"),
-                    "quantite": max(anomaly.get("seuil_min", 10) - anomaly.get("current_quantity", 0) + 5, 1),
-                    "perissable": False,
-                    "buffer_gaspillage_pct": None,
-                    "priorite": anomaly.get("severite", "HAUTE"),
-                    "delai_estime_heures": 48,
-                    "raison": "Fallback : décision automatique suite à échec LLM",
-                }
+            # Guarantee a task always gets produced, even if the LLM failed
+            # or forgot to call its tools.
+            if not tools.task_produced:
+                logger.warning("No task produced by the agent — using fallback decision (supplier order)")
+                decision = fallback_decision(anomaly)
+                produce_task(producer, decision)
+                tools.last_decision = decision
 
-            # Produce task
-            produce_task(producer, decision)
+            # Guarantee an audit trail for every decision (SKILL.md règle: traçabilité obligatoire).
+            if not tools.audit_produced:
+                produce_audit_log(producer, fallback_audit(anomaly, tools.last_decision or {}))
 
-            # Produce audit log
-            produce_audit_log(producer, anomaly, decision)
-
-            # Flush producer
             producer.flush(timeout=5)
-
             time.sleep(3)
 
     except Exception as e:

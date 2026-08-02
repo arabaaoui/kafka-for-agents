@@ -3,7 +3,13 @@ Execution Agent — Polls the 'tasks' topic via ShareGroupClient and executes ta
 
 Uses KIP-932 share group semantics: messages are locked when acquired,
 acknowledged on success, and automatically retried on failure (lock expiry).
-Simulates execution with a random delay of 1-10 seconds.
+
+The execution LLM is OPTIONAL. If EXECUTION_LLM_API_KEY is empty, no ADK agent
+is ever instantiated: execution is fully deterministic — a fixed 2s delay and
+100% success, no randomness — so the pipeline stays runnable without paying
+for a third LLM provider. When an execution LLM IS configured, a real ADK
+agent decides which tool to call (execute_transfer / execute_order), which
+simulate the real operation with a variable delay and occasional failure.
 """
 
 import json
@@ -11,7 +17,6 @@ import logging
 import os
 import random
 import signal
-import sys
 import time
 from datetime import datetime, timezone
 
@@ -20,8 +25,13 @@ from common.config import (
     TOPIC_TASKS,
     SHARE_GROUP_LOCK_DURATION_MS,
     SHARE_GROUP_MAX_DELIVERY_ATTEMPTS,
+    EXECUTION_LLM_PROVIDER,
+    EXECUTION_LLM_MODEL,
+    EXECUTION_LLM_API_KEY,
 )
 from common.share_group_client import ShareGroupClient, AcknowledgeType
+from common.adk_factory import AdkAgentRunner
+from execution.prompts import SYSTEM_PROMPT, EXECUTION_USER_PROMPT
 
 # Logging with [EXECUTION] prefix
 logging.basicConfig(
@@ -45,39 +55,70 @@ signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
 
 
-def simulate_execution(task: dict) -> dict:
-    """
-    Simulate the execution of a task with a random delay.
-    Returns a result dict with status and timing info.
-    """
-    delay = random.uniform(1, 10)
-    logger.info(
-        f"Executing task {task.get('task_id')}: action={task.get('action')} "
-        f"delay={delay:.1f}s"
-    )
-
-    time.sleep(delay)
-
-    # Simulate occasional failures (10% chance)
-    success = random.random() > 0.10
-
-    result = {
+def deterministic_execute(task: dict) -> dict:
+    """No-LLM execution path: fixed 2s delay, always succeeds — no randomness."""
+    logger.info(f"Executing task {task.get('task_id')} deterministically (no LLM configured): action={task.get('action')}")
+    time.sleep(2.0)
+    return {
         "task_id": task.get("task_id"),
         "action": task.get("action"),
-        "delay_s": round(delay, 2),
-        "success": success,
+        "delay_s": 2.0,
+        "success": True,
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    if success:
-        logger.info(f"Task {task.get('task_id')} completed successfully ({delay:.1f}s)")
-    else:
-        logger.warning(f"Task {task.get('task_id')} failed — will be retried")
 
-    return result
+class ExecutionTools:
+    """Tools exposed to the execution ADK agent (only used when an LLM is configured)."""
+
+    def __init__(self):
+        self.last_result: dict | None = None
+
+    def execute_transfer(self, task_json: str) -> dict:
+        """Execute an internal store-to-store transfer task. Simulates the logistics operation."""
+        return self._simulate(task_json)
+
+    def execute_order(self, task_json: str) -> dict:
+        """Execute a supplier order task. Simulates placing and confirming the order."""
+        return self._simulate(task_json)
+
+    def _simulate(self, task_json: str) -> dict:
+        task = json.loads(task_json) if isinstance(task_json, str) else task_json
+        delay = random.uniform(1, 10)
+        logger.info(f"Executing task {task.get('task_id')}: action={task.get('action')} delay={delay:.1f}s")
+        time.sleep(delay)
+        success = random.random() > 0.10
+        result = {
+            "task_id": task.get("task_id"),
+            "action": task.get("action"),
+            "delay_s": round(delay, 2),
+            "success": success,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.last_result = result
+        return result
 
 
-def process_task(client: ShareGroupClient, task_msg) -> bool:
+def run_with_llm(agent_runner: AdkAgentRunner, tools: ExecutionTools, task: dict) -> dict:
+    """Delegate execution to the ADK agent. Falls back to deterministic execution on any failure."""
+    tools.last_result = None
+    task_json = json.dumps(task, ensure_ascii=False)
+    user_prompt = EXECUTION_USER_PROMPT.format(task_json=task_json)
+    try:
+        response = agent_runner.run(user_prompt)
+        logger.info(f"Agent response: {response}")
+    except Exception as e:
+        logger.error(f"Execution LLM call failed for {task.get('task_id')}: {e} — falling back to deterministic execution")
+        return deterministic_execute(task)
+
+    if tools.last_result is not None:
+        return tools.last_result
+
+    logger.warning(f"Execution agent did not call an execution tool for {task.get('task_id')} — falling back")
+    return deterministic_execute(task)
+
+
+def process_task(client: ShareGroupClient, task_msg, agent_runner: AdkAgentRunner | None, tools: ExecutionTools | None) -> bool:
     """
     Process a single task from the share group.
     Returns True if the message was acknowledged, False if it should be retried.
@@ -85,7 +126,6 @@ def process_task(client: ShareGroupClient, task_msg) -> bool:
     task_id = "unknown"
 
     try:
-        # Parse the task payload
         value = task_msg.value
         if value is None:
             logger.warning("Received task with no value — acknowledging")
@@ -102,26 +142,20 @@ def process_task(client: ShareGroupClient, task_msg) -> bool:
             f"qty={task.get('quantite')}"
         )
 
-        # Simulate execution
-        delay = random.uniform(1, 10)
+        # Renew the lock immediately: execution duration is unpredictable when
+        # an LLM is in the loop, unlike a fixed deterministic delay.
+        client.acknowledge(task_msg, AcknowledgeType.RENEW)
 
-        # If delay > 5s, renew the lock to prevent expiry during execution
-        if delay > 5.0:
-            logger.info(f"Task {task_id}: long execution ({delay:.1f}s), renewing lock")
-            client.acknowledge(task_msg, AcknowledgeType.RENEW)
+        if agent_runner is not None:
+            result = run_with_llm(agent_runner, tools, task)
+        else:
+            result = deterministic_execute(task)
 
-        # Execute (sleep to simulate)
-        time.sleep(delay)
-
-        # Determine success (10% failure rate)
-        success = random.random() > 0.10
-
-        if success:
+        if result.get("success"):
             client.acknowledge(task_msg, AcknowledgeType.ACK)
-            logger.info(f"Task {task_id}: ACK — completed successfully ({delay:.1f}s)")
+            logger.info(f"Task {task_id}: ACK — completed successfully ({result.get('delay_s')}s)")
             return True
         else:
-            # Don't acknowledge — lock will expire and message will be retried
             logger.warning(
                 f"Task {task_id}: FAILED — not acknowledging, "
                 f"lock will expire and message will be retried"
@@ -130,20 +164,15 @@ def process_task(client: ShareGroupClient, task_msg) -> bool:
 
     except json.JSONDecodeError as e:
         logger.error(f"Task {task_id}: invalid JSON — {e}")
-        # Acknowledge bad messages to avoid poison-pill loops
         client.acknowledge(task_msg, AcknowledgeType.ACK)
         return True
     except Exception as e:
         logger.error(f"Task {task_id}: unexpected error — {e}")
-        # Don't acknowledge — retry
         return False
 
 
 def main():
     """Main loop — polls 'tasks' via share group, executes, acknowledges."""
-    global shutdown_event
-
-    # Create share group client
     group_id = os.getenv("SHARE_GROUP", "execution-group")
     consumer_id = f"executor-{os.getpid()}"
 
@@ -155,18 +184,33 @@ def main():
         max_delivery_attempts=SHARE_GROUP_MAX_DELIVERY_ATTEMPTS,
     )
 
+    agent_runner = None
+    tools = None
+    if EXECUTION_LLM_API_KEY:
+        tools = ExecutionTools()
+        agent_runner = AdkAgentRunner(
+            name="execution-agent",
+            description="Exécute les tâches de transfert interne et de commande fournisseur.",
+            instruction=SYSTEM_PROMPT,
+            tools=[tools.execute_transfer, tools.execute_order],
+            provider=EXECUTION_LLM_PROVIDER,
+            model=EXECUTION_LLM_MODEL,
+            api_key=EXECUTION_LLM_API_KEY,
+        )
+        logger.info(f"LLM: provider={EXECUTION_LLM_PROVIDER} model={EXECUTION_LLM_MODEL}")
+    else:
+        logger.info("No EXECUTION_LLM_API_KEY configured — running fully deterministic (fixed 2s delay, 100% success)")
+
     client.start()
     logger.info(f"Execution agent started: consumer_id={consumer_id} group={group_id}")
 
     try:
         while not shutdown_event:
-            # Poll for available messages
             messages = client.poll(timeout=1.0)
 
             for msg in messages:
-                process_task(client, msg)
+                process_task(client, msg, agent_runner, tools)
 
-            # Small sleep to avoid busy-looping
             time.sleep(0.5)
 
     except Exception as e:

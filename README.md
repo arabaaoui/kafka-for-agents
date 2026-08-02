@@ -2,9 +2,10 @@
 
 [![Kafka](https://img.shields.io/badge/Kafka-4.2.1-231F20?style=flat-square&logo=apache-kafka)](https://kafka.apache.org/)
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python)](https://www.python.org/)
+[![google-adk](https://img.shields.io/badge/google--adk-%3E%3D2.0-4285F4?style=flat-square)](https://pypi.org/project/google-adk/)
 [![Docker](https://img.shields.io/badge/Docker-Compose%20v2-2496ED?style=flat-square&logo=docker)](https://docs.docker.com/compose/)
 
-A proof-of-concept demonstrating how **Apache Kafka can serve as a native platform for AI agents** — enabling reliable, observable, and scalable multi-agent architectures for real-world business use cases like retail operations.
+A proof-of-concept demonstrating how **Apache Kafka can serve as a native platform for AI agents** — three real [google-adk](https://pypi.org/project/google-adk/) agents, each free to run a different LLM provider, cooperating over Kafka topics to run a retail replenishment pipeline end to end.
 
 > Article: [Kafka as an Agent-Native Platform — blog.dolizone.com](https://blog.dolizone.com)
 
@@ -12,45 +13,144 @@ A proof-of-concept demonstrating how **Apache Kafka can serve as a native platfo
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         RETAIL PIPELINE                                 │
-│                                                                         │
-│   ┌──────────────┐                                                      │
-│   │  SIMULATOR   │  Publishes fake orders (retail events)               │
-│   └──────┬───────┘                                                      │
-│          │                                                              │
-│          ▼                                                              │
-│   ┌──────────────┐     ┌──────────────┐     ┌──────────────┐           │
-│   │  DETECTION   │────▶│  DECISION    │────▶│  EXECUTION   │           │
-│   │  AGENT       │     │  AGENT       │     │  AGENT ×5    │           │
-│   │              │     │              │     │ (KIP-932)    │           │
-│   └──────┬───────┘     └──────┬───────┘     └──────┬───────┘           │
-│          │                    │                    │                    │
-│   ┌──────▼────────────────────▼────────────────────▼───────┐           │
-│   │                     APACHE KAFKA 4.2.1                  │           │
-│   │  ┌────────┐ ┌──────────┐ ┌───────────┐ ┌─────────┐   │           │
-│   │  │ orders │ │ anomalies │ │   tasks   │ │  audit  │   │           │
-│   │  └────────┘ └──────────┘ └───────────┘ └─────────┘   │           │
-│   │  ┌────────┐                                            │           │
-│   │  │ stocks │  (reference data)                          │           │
-│   │  └────────┘                                            │           │
-│   └────────────────────────────────────────────────────────┘           │
-│                                                                         │
-│   ┌──────────────┐     ┌──────────────┐                                │
-│   │  MCP         │     │  KAFKA UI    │                                │
-│   │  CONFLUENT   │     │  :8080       │                                │
-│   │  :3000       │     │              │                                │
-│   └──────────────┘     └──────────────┘                                │
-└─────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    SIM["Simulator<br/>200 stores × 50 products<br/>(no LLM)"]
+
+    subgraph KAFKA["Apache Kafka 4.2.1 (KRaft)"]
+        direction LR
+        T_STOCKS[("stocks")]
+        T_ANOM[("anomalies")]
+        T_TASKS[("tasks")]
+        T_AUDIT[("audit")]
+    end
+
+    subgraph DET["Detection Agent"]
+        direction TB
+        DET_FILTER["Python pre-filter<br/>quantity < seuil_min"]
+        DET_ADK["google-adk Agent<br/>DETECTION_LLM_*"]
+        DET_FILTER --> DET_ADK
+    end
+
+    subgraph DEC["Decision Agent"]
+        direction TB
+        DEC_SKILL["SKILL.md<br/>(loaded once at startup)"]
+        DEC_ADK["google-adk Agent<br/>DECISION_LLM_*"]
+        DEC_SKILL -.injected into instruction.-> DEC_ADK
+    end
+
+    subgraph EXE["Execution Agent ×N (KIP-932 share group)"]
+        direction TB
+        EXE_ADK["google-adk Agent (optional)<br/>EXECUTION_LLM_*"]
+        EXE_DET["Deterministic fallback<br/>fixed 2s, 100% success"]
+    end
+
+    MCP["MCP Confluent<br/>:3000"]
+    UI["Kafka UI<br/>:8080"]
+
+    SIM -->|produce| T_STOCKS
+    T_STOCKS -->|poll 5s| DET
+    DET -->|produce_anomaly tool| T_ANOM
+    T_ANOM -->|poll 3s| DEC
+    T_STOCKS -.get_neighbor_stocks tool.-> DEC
+    DEC -->|produce_task + log_audit tools| T_TASKS
+    DEC --> T_AUDIT
+    T_TASKS -->|ShareGroupClient.poll| EXE
+    EXE -.execute_transfer / execute_order tools.-> EXE_ADK
+    DET <-.call_mcp tool.-> MCP
+    KAFKA -.observe.-> UI
 ```
 
 **Pipeline flow:**
 
-1. **Simulator** → publishes synthetic orders to `orders` topic
-2. **Detection Agent** → consumes `orders`, detects anomalies, publishes to `anomalies`
-3. **Decision Agent** → reads `anomalies` + `stocks`, applies business logic via `SKILL.md`, writes `tasks`
-4. **Execution Agent ×N** → cooperative consumption of `tasks` (KIP-932 Share Groups), writes results to `audit`
+1. **Simulator** → publishes synthetic stock levels (and orders) to the `stocks` topic every cycle — no LLM involved.
+2. **Detection Agent** → a fast Python pre-filter (`quantity < seuil_min`) decides which of the ~10,000 stock messages/cycle are worth escalating; only those go through the real ADK agent, which qualifies severity and publishes to `anomalies` itself via its `produce_anomaly` tool.
+3. **Decision Agent** → reads `anomalies`, applies the `SKILL.md` procedure (injected into its instruction at startup), checks neighbor stocks, and publishes both a `tasks` entry and an `audit` entry via its own tools.
+4. **Execution Agent ×N** → cooperative consumption of `tasks` via KIP-932 Share Groups; executes (LLM-backed or deterministic) and acknowledges.
+
+---
+
+## Why the LLM only sees pre-filtered anomalies
+
+The simulator writes ~10,000 stock messages per cycle (200 stores × 50 products). Calling an LLM on every single one would be slow and needlessly expensive for a PoC. So the rule `quantity < seuil_min` stays where it belongs — in plain, free, instant Python — and only runs the ADK agent on messages that already cleared that bar. The agent's job is to **qualify** the anomaly (severity, type) and **decide to publish it**, not to scan the firehose.
+
+---
+
+## Sequence per agent
+
+### Detection Agent
+
+```mermaid
+sequenceDiagram
+    participant K as Kafka (stocks)
+    participant P as Python loop
+    participant A as ADK Agent (DETECTION_LLM)
+    participant M as MCP Confluent
+    participant K2 as Kafka (anomalies)
+
+    K->>P: poll(stocks message)
+    P->>P: is_anomaly()? quantity < seuil_min
+    alt below threshold
+        P->>A: run_prompt(store, product, quantity, seuil_min)
+        A->>M: call_mcp() [optional, for context]
+        M-->>A: recent stock messages
+        A->>A: qualify severity (CRITIQUE / HAUTE)
+        A->>K2: produce_anomaly(json) [tool call]
+        A-->>P: short text summary
+    else above threshold
+        P->>P: skip (no LLM call)
+    end
+```
+
+### Decision Agent
+
+```mermaid
+sequenceDiagram
+    participant K as Kafka (anomalies)
+    participant P as Python loop
+    participant A as ADK Agent (DECISION_LLM)
+    participant S as Kafka (stocks, neighbors)
+    participant T as Kafka (tasks)
+    participant AU as Kafka (audit)
+
+    Note over A: instruction = SYSTEM_PROMPT + SKILL.md<br/>(loaded once at startup)
+    K->>P: poll(anomaly message)
+    P->>A: run_prompt(anomaly fields)
+    A->>S: get_neighbor_stocks(region, product_id) [tool]
+    S-->>A: neighbor stock levels
+    A->>A: apply SKILL.md steps 2-5
+    A->>T: produce_task(json) [tool]
+    A->>AU: log_audit(json) [tool]
+    A-->>P: short text summary
+    alt agent failed or forgot a tool call
+        P->>T: fallback_decision() — default supplier order
+        P->>AU: fallback_audit()
+    end
+```
+
+### Execution Agent
+
+```mermaid
+sequenceDiagram
+    participant SG as ShareGroupClient (KIP-932)
+    participant P as Python loop
+    participant A as ADK Agent (EXECUTION_LLM, optional)
+
+    SG->>P: poll() → acquired task (locked)
+    P->>SG: acknowledge(RENEW) — extend lock immediately
+    alt EXECUTION_LLM_API_KEY set
+        P->>A: run_prompt(task json)
+        A->>A: execute_transfer() or execute_order() [tool]
+        A-->>P: result (success, delay)
+    else no LLM configured
+        P->>P: deterministic_execute() — fixed 2s, always succeeds
+    end
+    alt success
+        P->>SG: acknowledge(ACK)
+    else failure
+        P->>P: no ack — lock expires, message redelivered
+    end
+```
 
 ---
 
@@ -60,28 +160,62 @@ This PoC is built around three key Kafka capabilities that make it an ideal plat
 
 ### 1. MCP Confluent — LLMs Query Kafka Natively
 
-The [MCP Confluent](https://github.com/confluentinc/mcp-confluent) bridge exposes Kafka as a tool that LLMs can call directly. Instead of custom API layers, agents use the same Kafka protocol to read/write topics — enabling:
-
-- **Native integration**: LLMs discover topics, schemas, and messages through standard Kafka tooling
-- **Zero-copy data access**: Agents consume/produce directly on Kafka, no intermediate services
-- **Schema-aware queries**: Avro/Protobuf schemas provide type-safe interactions
+The [MCP Confluent](https://github.com/confluentinc/mcp-confluent) bridge exposes Kafka as a tool that LLMs can call directly (`consume-messages`, `list-topics`, `get-topic-config`, `get-consumer-group-lag`). The Detection Agent calls it through its `call_mcp` ADK tool — no custom API layer, the agent talks the same Kafka protocol as everything else.
 
 ### 2. Agent Skills — Business Logic via SKILL.md
 
-The Decision Agent's behavior is driven by a plain-text `SKILL.md` file — a declarative specification of business rules:
+The Decision Agent's behavior is driven by a plain-text [`SKILL.md`](skills/supply-chain-replenishment/SKILL.md) file — a declarative, 6-step specification of the replenishment procedure, read **once at startup** and injected straight into the ADK agent's `instruction`:
 
-- **Hot-reloadable**: Update `SKILL.md` and the agent adapts without redeployment
-- **Human-readable**: Business stakeholders can audit and modify agent behavior
-- **Version-controlled**: Skills live in Git alongside code — full change history and review
+- **Human-readable**: business stakeholders can audit and modify agent behavior without touching code
+- **Version-controlled**: skills live in Git alongside code — full change history and review
+- **Redeploy to update**: restart `decision-agent` to pick up a new `SKILL.md` revision
 
 ### 3. KIP-932 Share Groups — Cooperative Consumption with ACK/Retry
 
-Execution agents use [KIP-932](https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka) share groups:
+Execution agents use [KIP-932](https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka) share groups (emulated in [`share_group_client.py`](agents/common/share_group_client.py) since Python's `confluent-kafka` doesn't yet expose a native `KafkaShareConsumer`):
 
-- **Cooperative consumption**: Tasks are load-balanced across all agents — each task delivered to exactly one agent
-- **ACK-based delivery**: Tasks are only marked complete when the agent acknowledges — no data loss on crashes
-- **Auto-reassignment**: If an agent dies, its unacknowledged tasks are automatically reassigned to healthy agents
+- **Cooperative consumption**: tasks are load-balanced across all agents — each task delivered to exactly one agent
+- **ACK-based delivery**: tasks are only marked complete when the agent acknowledges — no data loss on crashes
+- **Auto-reassignment**: if an agent dies, its unacknowledged tasks are automatically reassigned to healthy agents after lock expiry
 - **Linear scalability**: `docker compose up -d --scale execution-agent=N` — add capacity instantly
+
+---
+
+## Real ADK agents, one LLM provider per agent
+
+Every agent (`detection`, `decision`, and optionally `execution`) is a real `google.adk.Agent` run through a `google.adk.Runner` — never a hand-rolled HTTP call to a provider API. [`agents/common/adk_factory.py`](agents/common/adk_factory.py) builds the model for any of the three agents from **three independent env var blocks**, so each agent can use a different provider and model:
+
+```python
+def create_llm(provider: str, model: str, api_key: str):
+    if provider == "openai":
+        return LiteLlm(model=f"openai/{model}", api_key=api_key)
+    if provider == "anthropic":
+        return LiteLlm(model=f"anthropic/{model}", api_key=api_key)
+    if provider == "gemini":
+        return LiteLlm(model=f"gemini/{model}", api_key=api_key)
+    raise ValueError(f"Unknown LLM provider: {provider}")
+```
+
+All three providers are routed through [LiteLLM](https://docs.litellm.ai/) — there's no provider-specific SDK wiring, no separate `AnthropicLlm`/`Claude` branch, and no OpenAI-only payload assumption baked into the code.
+
+```env
+# Detection Agent
+DETECTION_LLM_PROVIDER=openai
+DETECTION_LLM_MODEL=gpt-4o
+DETECTION_LLM_API_KEY=sk-...
+
+# Decision Agent
+DECISION_LLM_PROVIDER=anthropic
+DECISION_LLM_MODEL=claude-sonnet-4-20250514
+DECISION_LLM_API_KEY=sk-ant-...
+
+# Execution Agent — OPTIONAL
+EXECUTION_LLM_PROVIDER=gemini
+EXECUTION_LLM_MODEL=gemini-2.5-pro
+EXECUTION_LLM_API_KEY=          # empty = deterministic, no LLM call at all
+```
+
+**Execution without an LLM key** doesn't fall back to a random simulation — it's a fully deterministic path: fixed 2-second delay, 100% success, zero randomness. That keeps the demo runnable end-to-end with just two LLM keys (Detection + Decision) if you don't want to pay for a third provider.
 
 ---
 
@@ -90,7 +224,7 @@ Execution agents use [KIP-932](https://cwiki.apache.org/confluence/display/KAFKA
 ### Prerequisites
 
 - Docker & Docker Compose v2
-- An LLM API key (OpenAI-compatible endpoint)
+- At least two LLM API keys (Detection + Decision are required; Execution is optional)
 
 ### Setup
 
@@ -102,11 +236,7 @@ cd kafka-retail-agents-poc
 # 2. Create your environment file
 cp .env.example .env
 
-# 3. Edit .env — set your LLM API key and endpoint
-#    Required: LLM_API_KEY=sk-...
-#    Optional: LLM_BASE_URL (default: https://api.openai.com/v1)
-#    Optional: LLM_MODEL (default: gpt-4o-mini)
-
+# 3. Edit .env — set DETECTION_LLM_API_KEY and DECISION_LLM_API_KEY at minimum
 vim .env
 
 # 4. Start the full pipeline
@@ -129,9 +259,9 @@ Three self-contained demo scripts showcase the platform's capabilities:
 
 Starts all services, waits for Kafka initialization, and shows the complete 3-agent pipeline flowing:
 
-- Simulator generates orders
-- Detection agent finds anomalies
-- Decision agent creates tasks via SKILL.md
+- Simulator generates stock levels
+- Detection agent (ADK) qualifies and publishes anomalies
+- Decision agent (ADK) creates tasks via `SKILL.md`
 - Execution agent processes tasks into audit records
 
 ### Demo 2 — Horizontal Scaling
@@ -165,33 +295,38 @@ Demonstrates automatic failure recovery:
 
 ```
 kafka-retail-agents-poc/
-├── .env.example              # Environment variable template
-├── .gitignore
-├── README.md                 # This file
-├── docker-compose.yml        # Complete stack definition
+├── .env.example                      # Environment variable template (3 LLM blocks)
+├── docker-compose.yml                # Complete stack definition
+├── PLAN.md                           # Implementation plan / design notes
 ├── scripts/
-│   ├── demo-1-full-pipeline.sh   # Full pipeline startup demo
-│   ├── demo-2-scale.sh           # Horizontal scaling demo
-│   └── demo-3-crash.sh           # Crash recovery demo
-├── kafka-init/
-│   └── create-topics.sh      # Topic creation on startup
-├── simulator/
-│   ├── Dockerfile
-│   └── main.py               # Synthetic order generator
-├── detection-agent/
-│   ├── Dockerfile
-│   └── agent.py              # Anomaly detection logic
-├── decision-agent/
-│   ├── Dockerfile
-│   ├── agent.py              # Decision logic engine
-│   └── SKILL.md              # Business rules (Agent Skill)
-├── execution-agent/
-│   ├── Dockerfile
-│   └── agent.py              # Task executor (Share Group consumer)
+│   ├── demo-1-full-pipeline.sh       # Full pipeline startup demo
+│   ├── demo-2-scale.sh               # Horizontal scaling demo
+│   └── demo-3-crash.sh               # Crash recovery demo
+├── skills/
+│   └── supply-chain-replenishment/
+│       └── SKILL.md                  # Business rules (Agent Skill) — Decision Agent
 ├── mcp-confluent/
-│   └── ...                   # MCP Confluent bridge config
-└── kafka-ui/
-    └── ...                   # Kafka UI configuration
+│   ├── Dockerfile
+│   ├── package.json
+│   └── server.js                     # MCP server exposing Kafka tools (KafkaJS)
+└── agents/
+    ├── Dockerfile.agent              # Shared image for simulator + 3 agents
+    ├── common/
+    │   ├── config.py                 # Env-driven config, 3 LLM blocks
+    │   ├── adk_factory.py            # LiteLLM-backed google-adk Agent factory + runner
+    │   ├── share_group_client.py     # KIP-932 emulator (ACK/RENEW/RELEASE, dead-letter)
+    │   └── requirements.txt
+    ├── simulator/
+    │   └── app.py                    # Synthetic stock/order generator (no LLM)
+    ├── detection/
+    │   ├── agent.py                  # Pre-filter + ADK Agent (produce_anomaly tool)
+    │   └── prompts.py
+    ├── decision/
+    │   ├── agent.py                  # ADK Agent (get_neighbor_stocks, produce_task, log_audit)
+    │   └── prompts.py
+    └── execution/
+        ├── agent.py                  # ShareGroupClient consumer + optional ADK Agent
+        └── prompts.py
 ```
 
 ---
@@ -200,12 +335,20 @@ kafka-retail-agents-poc/
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `LLM_API_KEY` | **Yes** | — | OpenAI-compatible API key |
-| `LLM_BASE_URL` | No | `https://api.openai.com/v1` | API base URL |
-| `LLM_MODEL` | No | `gpt-4o-mini` | Model name |
+| `DETECTION_LLM_PROVIDER` | No | `openai` | `openai` \| `anthropic` \| `gemini` |
+| `DETECTION_LLM_MODEL` | No | `gpt-4o` | Model name |
+| `DETECTION_LLM_API_KEY` | **Yes** | — | API key for the Detection Agent |
+| `DECISION_LLM_PROVIDER` | No | `anthropic` | `openai` \| `anthropic` \| `gemini` |
+| `DECISION_LLM_MODEL` | No | `claude-sonnet-4-20250514` | Model name |
+| `DECISION_LLM_API_KEY` | **Yes** | — | API key for the Decision Agent |
+| `EXECUTION_LLM_PROVIDER` | No | *(empty)* | `openai` \| `anthropic` \| `gemini` |
+| `EXECUTION_LLM_MODEL` | No | *(empty)* | Model name |
+| `EXECUTION_LLM_API_KEY` | No | *(empty)* | Leave empty for deterministic execution (fixed 2s, 100% success) |
 | `KAFKA_BOOTSTRAP_SERVERS` | No | `kafka:9092` | Kafka broker address |
-| `SHARE_GROUP` | No | `execution-group` | KIP-932 share group name |
-| `LOG_LEVEL` | No | `INFO` | Logging verbosity |
+| `MCP_CONFLUENT_URL` | No | `http://mcp-confluent:3000` | MCP Confluent HTTP endpoint |
+| `SHARE_GROUP_LOCK_DURATION_MS` | No | `30000` | KIP-932 lock duration before a task is redelivered |
+| `SHARE_GROUP_MAX_DELIVERY_ATTEMPTS` | No | `5` | Attempts before a task is dead-lettered |
+| `SIMULATION_SPEED` | No | `1.0` | `1.0` = real-time, `60.0` = 1h of data in 1 minute |
 
 ---
 
@@ -213,7 +356,7 @@ kafka-retail-agents-poc/
 
 - **Docker** 24+ (with Docker Compose v2)
 - **Python 3.11** (for local development; not required for Docker-only usage)
-- **LLM API key** (OpenAI, or any OpenAI-compatible provider via `LLM_BASE_URL`)
+- **Two LLM API keys minimum** (Detection + Decision) — any of OpenAI, Anthropic, or Gemini
 - **~4 GB RAM** available for the full stack
 
 ---
