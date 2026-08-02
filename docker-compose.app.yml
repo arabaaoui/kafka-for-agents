@@ -1,0 +1,98 @@
+version: "3.8"
+
+networks:
+  kafka-retail-test:
+    external: true
+
+services:
+  # ===========================================================================
+  # MCP Confluent — Standalone MCP server exposing Kafka tools to LLMs
+  # ===========================================================================
+  mcp-confluent:
+    build:
+      context: ./mcp-confluent
+    ports:
+      - "3000:3000"
+    networks:
+      - kafka-retail-test
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9093
+      MCP_PORT: "3000"
+
+  # ===========================================================================
+  # Simulator — Generates synthetic retail data (orders + stock levels)
+  # ===========================================================================
+  simulator:
+    build:
+      context: ./agents
+      dockerfile: Dockerfile.agent
+    command: python -m simulator.app
+    networks:
+      - kafka-retail-test
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9093
+      SIMULATION_SPEED: ${SIMULATION_SPEED:-1.0}
+    restart: unless-stopped
+
+  # ===========================================================================
+  # Agent 1 — Detection (ADK + MCP Confluent tools)
+  # ===========================================================================
+  detection-agent:
+    build:
+      context: ./agents
+      dockerfile: Dockerfile.agent
+    command: python -m detection.agent
+    networks:
+      - kafka-retail-test
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9093
+      MCP_CONFLUENT_URL: http://mcp-confluent:3000
+      DETECTION_LLM_PROVIDER: ${DETECTION_LLM_PROVIDER:-openai}
+      DETECTION_LLM_MODEL: ${DETECTION_LLM_MODEL:-gpt-4o}
+      DETECTION_LLM_API_KEY: ${DETECTION_LLM_API_KEY}
+    depends_on:
+      mcp-confluent:
+        condition: service_started
+    restart: unless-stopped
+
+  # ===========================================================================
+  # Agent 2 — Decision (ADK + Agent Skill SKILL.md)
+  # ===========================================================================
+  decision-agent:
+    build:
+      context: ./agents
+      dockerfile: Dockerfile.agent
+    command: python -m decision.agent
+    networks:
+      - kafka-retail-test
+    volumes:
+      - ./skills:/app/skills:ro
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9093
+      SKILL_PATH: /app/skills/supply-chain-replenishment/SKILL.md
+      DECISION_LLM_PROVIDER: ${DECISION_LLM_PROVIDER:-anthropic}
+      DECISION_LLM_MODEL: ${DECISION_LLM_MODEL:-claude-sonnet-4-20250514}
+      DECISION_LLM_API_KEY: ${DECISION_LLM_API_KEY}
+    restart: unless-stopped
+
+  # ===========================================================================
+  # Agent 3 — Execution (ADK + KIP-932 share group)
+  # ===========================================================================
+  execution-agent:
+    build:
+      context: ./agents
+      dockerfile: Dockerfile.agent
+    # Scale with: docker compose -f docker-compose.app.yml up -d --scale execution-agent=5
+    command: python -m execution.agent
+    networks:
+      - kafka-retail-test
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9093
+      SHARE_GROUP: execution-group
+      SHARE_GROUP_LOCK_DURATION_MS: ${SHARE_GROUP_LOCK_DURATION_MS:-30000}
+      SHARE_GROUP_MAX_DELIVERY_ATTEMPTS: ${SHARE_GROUP_MAX_DELIVERY_ATTEMPTS:-5}
+      # Optional — leave empty to run this agent fully deterministic (no LLM call).
+      EXECUTION_LLM_PROVIDER: ${EXECUTION_LLM_PROVIDER:-}
+      EXECUTION_LLM_MODEL: ${EXECUTION_LLM_MODEL:-}
+      EXECUTION_LLM_API_KEY: ${EXECUTION_LLM_API_KEY:-}
+    restart: unless-stopped

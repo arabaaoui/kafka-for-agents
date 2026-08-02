@@ -291,6 +291,35 @@ Demonstrates automatic failure recovery:
 
 ---
 
+## Development & Testing
+
+For local development, the stack can be split into two independent Compose files sharing an external Docker network — a standalone test Kafka cluster (`docker-compose.test.yml`) and the application services (`docker-compose.app.yml`). This lets you restart the agents without tearing down (or losing data in) the Kafka broker, and vice versa.
+
+| File | Contains | Kafka port |
+|------|----------|------------|
+| `docker-compose.test.yml` | Standalone Kafka 4.2.1 (KRaft, 1 broker) + topic init (`orders`, `stocks`, `anomalies`, `tasks`, `audit`) | `9093` |
+| `docker-compose.app.yml` | `mcp-confluent`, `simulator`, `detection-agent`, `decision-agent`, `execution-agent` (no Kafka, no Kafka UI) | — (connects to `kafka:9093`) |
+
+Both files attach to a shared external network, `kafka-retail-test`, so the app services resolve the test broker by its service name (`kafka`).
+
+### Makefile targets
+
+```bash
+make test-stack   # start the standalone test Kafka cluster (port 9093)
+make app          # start the app services against the test cluster
+make all          # test-stack + app in one go
+make logs         # follow app service logs
+make logs-test    # follow Kafka test cluster logs
+make stop-app     # stop the app services
+make stop-test    # stop the test Kafka cluster
+make clean        # stop everything and remove the test Kafka volume
+make clean-all     # clean + remove the shared kafka-retail-test network
+```
+
+`make test-stack` creates the `kafka-retail-test` network if it doesn't already exist. This test setup is entirely independent from the main `docker-compose.yml` stack (different Kafka port, different network) — the two can coexist without conflicting.
+
+---
+
 ## Project Structure
 
 ```
