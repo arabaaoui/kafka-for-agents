@@ -76,7 +76,7 @@ check:
 	@echo ""
 	@echo "--- Topic Message Counts ---"
 	@for topic in orders stocks anomalies tasks audit; do \
-		count=$$(docker compose -f docker-compose.test.yml exec -T kafka /opt/kafka/bin/kafka-run-class.sh kafka.tools.GetOffsetShell --bootstrap-server kafka:9093 --topic $$topic --time -1 2>/dev/null | awk -F: '{sum+=$$NF} END{print sum+0}'); \
+		count=$$(docker compose -f docker-compose.test.yml exec -T kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:9093 --topic $$topic --time -1 2>/dev/null | awk -F: '{sum+=$$3} END{print sum+0}'); \
 		echo "  $$topic: $$count messages"; \
 	done
 	@echo ""

@@ -71,7 +71,7 @@ services:
       context: ./mcp-confluent
     container_name: mcp-confluent
     ports:
-      - "3000:3000"
+      - "3005:3000"
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       MCP_PORT: "3000"

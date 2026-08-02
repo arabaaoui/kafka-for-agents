@@ -54,7 +54,7 @@ services:
   # kcat — One-shot topic summary, printed once the broker is ready
   # ===========================================================================
   kcat:
-    image: edenhill/kcat:latest
+    image: edenhill/kcat:1.7.1
     container_name: kcat-test
     networks:
       - kafka-retail-test

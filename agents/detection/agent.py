@@ -210,7 +210,6 @@ def main():
                 continue
 
             if not is_anomaly(stock_data):
-                time.sleep(5)
                 continue
 
             logger.warning(
