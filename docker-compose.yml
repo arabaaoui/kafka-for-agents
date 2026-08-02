@@ -1,0 +1,169 @@
+version: "3.8"
+
+services:
+  # ===========================================================================
+  # Kafka 4.2.1 — KRaft mode, no ZooKeeper
+  # ===========================================================================
+  kafka:
+    image: apache/kafka:4.2.1
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # ===========================================================================
+  # Kafka UI — Web dashboard
+  # ===========================================================================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: retail-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ===========================================================================
+  # Topic initializer — Creates topics on startup
+  # ===========================================================================
+  kafka-init:
+    image: apache/kafka:4.2.1
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "Creating topics..."
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic orders --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic stocks --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic anomalies --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic tasks --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic audit --partitions 1 --replication-factor 1
+        echo "Topics ready."
+
+  # ===========================================================================
+  # MCP Confluent — Standalone MCP server exposing Kafka tools to LLMs
+  # ===========================================================================
+  mcp-confluent:
+    build:
+      context: ./mcp-confluent
+    container_name: mcp-confluent
+    ports:
+      - "3000:3000"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      MCP_PORT: "3000"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  # ===========================================================================
+  # Simulator — Generates synthetic retail data (orders + stock levels)
+  # ===========================================================================
+  simulator:
+    build:
+      context: ./agents
+      dockerfile: Dockerfile.agent
+    container_name: simulator
+    command: python -m simulator.app
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SIMULATION_SPEED: ${SIMULATION_SPEED:-1.0}
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ===========================================================================
+  # Agent 1 — Detection (ADK + MCP Confluent tools)
+  # ===========================================================================
+  detection-agent:
+    build:
+      context: ./agents
+      dockerfile: Dockerfile.agent
+    container_name: detection-agent
+    command: python -m detection.agent
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      MCP_CONFLUENT_URL: http://mcp-confluent:3000
+      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+      LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-20250514}
+      LLM_API_KEY: ${LLM_API_KEY}
+    depends_on:
+      mcp-confluent:
+        condition: service_started
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ===========================================================================
+  # Agent 2 — Decision (ADK + Agent Skill SKILL.md)
+  # ===========================================================================
+  decision-agent:
+    build:
+      context: ./agents
+      dockerfile: Dockerfile.agent
+    container_name: decision-agent
+    command: python -m decision.agent
+    volumes:
+      - ./skills:/app/skills:ro
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SKILL_PATH: /app/skills/supply-chain-replenishment/SKILL.md
+      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+      LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-20250514}
+      LLM_API_KEY: ${LLM_API_KEY}
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ===========================================================================
+  # Agent 3 — Execution (ADK + KIP-932 share group)
+  # ===========================================================================
+  execution-agent:
+    build:
+      context: ./agents
+      dockerfile: Dockerfile.agent
+    # Scale with: docker compose up -d --scale execution-agent=5
+    command: python -m execution.agent
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SHARE_GROUP: execution-group
+      SHARE_GROUP_LOCK_DURATION_MS: ${SHARE_GROUP_LOCK_DURATION_MS:-30000}
+      SHARE_GROUP_MAX_DELIVERY_ATTEMPTS: ${SHARE_GROUP_MAX_DELIVERY_ATTEMPTS:-5}
+      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+      LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-20250514}
+      LLM_API_KEY: ${LLM_API_KEY}
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  kafka-data:
