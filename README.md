@@ -234,7 +234,13 @@ The Decision Agent's behavior is driven by a plain-text [`SKILL.md`](skills/supp
 
 ### 3. KIP-932 Share Groups — Cooperative Consumption with ACK/Retry
 
-Execution agents consume the `tasks` topic using [KIP-932](https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka) share group semantics. The Python library `confluent-kafka` doesn't expose a native `KafkaShareConsumer` yet (the protocol is implemented at broker level in Kafka 4.x, but the Python client hasn't caught up), so [`share_group_client.py`](agents/common/share_group_client.py) wraps a standard `Consumer` with an **application-layer emulation** of the KIP-932 state machine — per-message locks, ACK/RENEW/RELEASE lifecycle, lock expiry, and dead-letter after max delivery attempts:
+> **⚠️ Important — Why this PoC emulates KIP-932 instead of using the native `ShareConsumer`**
+>
+> `confluent-kafka-python` **2.15.0** (released 2026) ships a `ShareConsumer` class in **Preview** mode that exposes KIP-932 natively.
+> This PoC nevertheless uses an **application-layer emulator** ([`share_group_client.py`](agents/common/share_group_client.py)) instead.
+> Here is why.
+
+Execution agents consume the `tasks` topic using [KIP-932](https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka) share group semantics. [`share_group_client.py`](agents/common/share_group_client.py) wraps a standard `Consumer` with an **application-layer emulation** of the KIP-932 state machine — per-message locks, ACK/RENEW/RELEASE lifecycle, lock expiry, and dead-letter after max delivery attempts:
 
 - **Cooperative consumption**: partitions are distributed by Kafka's native consumer group protocol; the emulation adds per-message locking on top so tasks aren't processed by two agents simultaneously
 - **ACK-based delivery**: tasks are only marked complete when the agent calls `acknowledge(ACK)` — the standard consumer offset is committed only then
@@ -242,7 +248,48 @@ Execution agents consume the `tasks` topic using [KIP-932](https://cwiki.apache.
 - **Dead-letter**: after `max_delivery_attempts` failed deliveries, the task is silently dropped with a log warning
 - **Linear scalability**: `docker compose up -d --scale execution-agent=N` — new agents join the consumer group and immediately receive partitions
 
-The day `confluent-kafka` ships `KafkaShareConsumer`, the emulation layer can be swapped for the native implementation — the public API (`poll()`, `acknowledge()`) stays identical.
+#### Obstacles to using the native `ShareConsumer` today
+
+Three concrete blockers prevent adopting the native Python `ShareConsumer` (v2.15.0 Preview) in this PoC right now:
+
+**A. Missing `RENEW` action in the Python client — the LLM lock problem**
+
+In the native Java `KafkaShareConsumer`, you can call `acknowledge(record, AcknowledgeType.RENEW)` to extend the acquisition lock while a long-running operation (e.g. an LLM call taking 5–15 seconds) is in flight. The Python `ShareConsumer` (2.15.0 Preview) only exposes `ACCEPT` (ACK) and `RELEASE`/`REJECT` — there is no way to renew a lock dynamically from Python.
+
+- **Risk**: if the LLM is slow, the broker-side lock expires before the agent finishes responding, triggering a **duplicate execution** of the task by another agent.
+- **Workaround**: set an arbitrarily long lock duration (e.g. 60s) at the broker level — but this delays recovery in case of a real crash, defeating the purpose of cooperative consumption.
+
+**B. Strict broker configuration required**
+
+Share groups are not enabled by default in Kafka 4.2.x. The broker must be explicitly configured with:
+
+```yaml
+KAFKA_SHARE_GROUP_ENABLE: "true"
+KAFKA_GROUP_COORDINATOR_REBALANCE_PROTOCOLS: "classic,consumer,share"
+```
+
+Without these flags, `ShareConsumer` returns a `UnsupportedVersionException` — the group coordinator rejects the share protocol.
+
+**C. librdkafka binary wheels and build time**
+
+The Python client is a C wrapper around `librdkafka`. Preview releases like 2.15.0 don't always ship pre-compiled wheels for every architecture (notably Apple Silicon M1/M2/M3 and ARM64 Linux). Without a wheel, `pip install` falls back to compiling `librdkafka` from source — requiring `gcc`, `g++`, `make` and adding 10–15 minutes to the Docker build.
+
+#### Consequences of switching to the native `ShareConsumer`
+
+| | Impact |
+|---|---|
+| ✅ **Zero emulation code** | Delete `share_group_client.py` and the local JSON persistence files (`/tmp/share-group-*.json`) |
+| ✅ **Protocol fidelity** | The PoC exercises the real KIP-932 network protocol, not an approximation |
+| ✅ **Distributed state** | Delivery state lives in the broker's memory, not on the container's local disk — survives container recreation |
+| ❌ **Loss of cloud portability** | Most managed Kafka services (AWS MSK, Confluent Cloud, Aiven) haven't enabled share groups in production yet — the PoC would be strictly limited to a local Kafka 4.2+ Docker setup |
+| ❌ **API instability** | The `ShareConsumer` interface is in Preview — minor version bumps of `confluent-kafka` may break the API without notice |
+| ❌ **Offline testing breaks** | The deterministic test suite (`test_deterministic_flow.py`) runs without any Docker container. `ShareConsumer` opens native C sockets via `librdkafka` at instantiation — making it impossible to test offline without heavy mocking of the C library |
+
+#### Conclusion
+
+This PoC is a **demonstration and learning tool**. Its goal is to show how three AI agents cooperate over Kafka using KIP-932 semantics — anywhere, including offline on a laptop. Until `confluent-kafka-python` reaches **GA** for the `ShareConsumer` (with `RENEW` support), the emulator reproduces the KIP-932 lifecycle faithfully: `AVAILABLE → ACQUIRED → ACKNOWLEDGED`, lock expiry, delivery counting, and dead-letter — without the build, cloud, and testing constraints of the Preview native client.
+
+The public API (`poll()`, `acknowledge()`, `release()`) is designed to mirror the native `ShareConsumer`, so the swap will be a drop-in replacement when the time comes.
 
 ---
 
@@ -267,17 +314,17 @@ All three providers are routed through [LiteLLM](https://docs.litellm.ai/) — t
 # Detection Agent — OPTIONAL
 DETECTION_LLM_PROVIDER=openai
 DETECTION_LLM_MODEL=gpt-4o
-DETECTION_LLM_API_KEY=          # empty = deterministic, no LLM call at all
+DETECTION_LLM_API_KEY=*** empty = deterministic, no LLM call at all
 
 # Decision Agent — OPTIONAL
 DECISION_LLM_PROVIDER=anthropic
 DECISION_LLM_MODEL=claude-sonnet-4-20250514
-DECISION_LLM_API_KEY=           # empty = deterministic, no LLM call at all
+DECISION_LLM_API_KEY=*** empty = deterministic, no LLM call at all
 
 # Execution Agent — OPTIONAL
 EXECUTION_LLM_PROVIDER=gemini
 EXECUTION_LLM_MODEL=gemini-2.5-pro
-EXECUTION_LLM_API_KEY=          # empty = deterministic, no LLM call at all
+EXECUTION_LLM_API_KEY=*** empty = deterministic, no LLM call at all
 ```
 
 **All three agents are runnable with zero LLM keys.** Each one follows the same principle: if its `*_LLM_API_KEY` is empty, no `AdkAgentRunner` is ever instantiated — the agent falls back to a fixed, deterministic path instead of calling out to a provider:
