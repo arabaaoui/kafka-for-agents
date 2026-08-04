@@ -7,7 +7,7 @@
 
 A proof-of-concept demonstrating how **Apache Kafka can serve as a native platform for AI agents** — three real [google-adk](https://pypi.org/project/google-adk/) agents, each free to run a different LLM provider, cooperating over Kafka topics to run a retail replenishment pipeline end to end.
 
-> Article: [Kafka as an Agent-Native Platform — blog.dolizone.com](https://blog.dolizone.com)
+> Article: [Kafka remplace vos middlewares — une supply chain de 200 magasins pilotée par 3 agents IA]([[https://blog.dolizone.com](https://kafblog.dolizone.com/blog/kafka-agents-supply-chain)]([https://kafblog.dolizone.com/](https://kafblog.dolizone.com/blog/kafka-agents-supply-chain)))
 
 ---
 
