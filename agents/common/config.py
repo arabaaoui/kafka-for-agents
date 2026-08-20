@@ -36,9 +36,9 @@ EXECUTION_LLM_PROVIDER = os.getenv("EXECUTION_LLM_PROVIDER", "")
 EXECUTION_LLM_MODEL = os.getenv("EXECUTION_LLM_MODEL", "")
 EXECUTION_LLM_API_KEY = os.getenv("EXECUTION_LLM_API_KEY", "")
 
-# Share Group
+# Share Group — broker-side settings (informative, applied in docker-compose.yml)
 SHARE_GROUP_LOCK_DURATION_MS = int(os.getenv("SHARE_GROUP_LOCK_DURATION_MS", "30000"))
-SHARE_GROUP_MAX_DELIVERY_ATTEMPTS = int(os.getenv("SHARE_GROUP_MAX_DELIVERY_ATTEMPTS", "5"))
+SHARE_GROUP_DELIVERY_COUNT_LIMIT = int(os.getenv("SHARE_GROUP_DELIVERY_COUNT_LIMIT", "5"))
 
 # Simulation
 SIMULATION_SPEED = float(os.getenv("SIMULATION_SPEED", "1.0"))
