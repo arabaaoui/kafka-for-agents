@@ -90,7 +90,6 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9093
       SHARE_GROUP: execution-group
       SHARE_GROUP_LOCK_DURATION_MS: ${SHARE_GROUP_LOCK_DURATION_MS:-30000}
-      SHARE_GROUP_MAX_DELIVERY_ATTEMPTS: ${SHARE_GROUP_MAX_DELIVERY_ATTEMPTS:-5}
       # Optional — leave empty to run this agent fully deterministic (no LLM call).
       EXECUTION_LLM_PROVIDER: ${EXECUTION_LLM_PROVIDER:-}
       EXECUTION_LLM_MODEL: ${EXECUTION_LLM_MODEL:-}
