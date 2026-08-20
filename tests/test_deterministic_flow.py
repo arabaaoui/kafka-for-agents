@@ -9,6 +9,12 @@ MCP Confluent, providers LLM) : toutes les variables d'environnement
 nécessaires sont fixées ci-dessous, et les fonctions testées sont soit pures
 (is_anomaly, fallback_decision, deterministic_execute), soit appelées avec un
 producer Kafka factice (FakeProducer) qui n'ouvre aucune connexion réseau.
+
+common.share_group_client wraps the native confluent_kafka.ShareConsumer,
+which opens real C sockets via librdkafka as soon as it's instantiated — so
+Test 6 below patches it with a FakeNativeShareConsumer (in-memory, no I/O)
+to exercise ShareGroupClient's poll()/acknowledge()/commit_sync() mapping
+offline.
 """
 
 import json
@@ -29,7 +35,7 @@ os.environ["EXECUTION_LLM_PROVIDER"] = ""
 os.environ["EXECUTION_LLM_MODEL"] = ""
 os.environ["EXECUTION_LLM_API_KEY"] = ""
 os.environ["SHARE_GROUP_LOCK_DURATION_MS"] = "30000"
-os.environ["SHARE_GROUP_MAX_DELIVERY_ATTEMPTS"] = "5"
+os.environ["SHARE_GROUP_DELIVERY_COUNT_LIMIT"] = "5"
 os.environ["SIMULATION_SPEED"] = "1.0"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -299,6 +305,133 @@ def test_adk_factory() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Test 6 — ShareGroupClient (native ShareConsumer mocked, no real sockets)
+# ---------------------------------------------------------------------------
+
+class FakeMessage:
+    """Stand-in for confluent_kafka.Message — a plain record, no C object."""
+
+    def __init__(self, topic, partition, offset, key, value, delivery_count=1):
+        self._topic = topic
+        self._partition = partition
+        self._offset = offset
+        self._key = key
+        self._value = value
+        self._delivery_count = delivery_count
+
+    def topic(self):
+        return self._topic
+
+    def partition(self):
+        return self._partition
+
+    def offset(self):
+        return self._offset
+
+    def key(self):
+        return self._key.encode("utf-8") if self._key else None
+
+    def value(self):
+        return self._value.encode("utf-8") if self._value else None
+
+    def error(self):
+        return None
+
+    def delivery_count(self):
+        return self._delivery_count
+
+
+class FakeMessages(list):
+    """Stand-in for confluent_kafka.Messages — the batch container returned by poll()."""
+
+    def is_empty(self):
+        return len(self) == 0
+
+
+class FakeNativeShareConsumer:
+    """Stand-in for confluent_kafka.ShareConsumer — records calls, opens no sockets."""
+
+    def __init__(self, conf):
+        self.conf = conf
+        self.subscribed: list[str] = []
+        self.acknowledged: list[tuple] = []
+        self.commits = 0
+        self.closed = False
+        self._next_batch = FakeMessages(
+            [FakeMessage("tasks", 0, 42, "store-42", '{"task_id": "task-1"}', delivery_count=1)]
+        )
+
+    def subscribe(self, topics):
+        self.subscribed = list(topics)
+
+    def poll(self, timeout):
+        batch, self._next_batch = self._next_batch, FakeMessages([])
+        return batch
+
+    def acknowledge(self, message, ack_type):
+        self.acknowledged.append((message, ack_type))
+
+    def commit_sync(self):
+        self.commits += 1
+
+    def close(self):
+        self.closed = True
+
+
+def test_share_group_client() -> bool:
+    try:
+        from unittest.mock import patch
+        from confluent_kafka import AcknowledgeType as NativeAckType
+        from common import share_group_client as sgc
+    except Exception as e:
+        print(f"  ❌ Impossible d'importer common.share_group_client — {e}")
+        return False
+
+    ok = True
+    fake_consumer = FakeNativeShareConsumer({})
+
+    with patch.object(sgc, "NativeShareConsumer", return_value=fake_consumer):
+        client = sgc.ShareGroupClient(group_id="test-group", topics=["tasks"], consumer_id="test-consumer")
+
+        client.start()
+        ok &= check("start() souscrit au bon topic (via le ShareConsumer natif mocké)", fake_consumer.subscribed == ["tasks"])
+
+        messages = client.poll(timeout=1.0)
+        ok &= check("poll() retourne exactement 1 message", len(messages) == 1)
+        if not messages:
+            return False
+        msg = messages[0]
+        ok &= check("poll() décode value en str", msg.value == '{"task_id": "task-1"}')
+        ok &= check("poll() expose delivery_count()", msg.delivery_count == 1)
+
+        # Second poll returns an empty batch — mirrors the real broker with nothing left to acquire.
+        ok &= check("poll() suivant (batch vide) renvoie []", client.poll(timeout=1.0) == [])
+
+        client.acknowledge(msg, sgc.AcknowledgeType.ACK)
+        ok &= check("acknowledge(ACK) mappe vers AcknowledgeType.ACCEPT", fake_consumer.acknowledged[-1][1] == NativeAckType.ACCEPT)
+
+        client.acknowledge(msg, sgc.AcknowledgeType.RELEASE)
+        ok &= check("acknowledge(RELEASE) mappe vers AcknowledgeType.RELEASE", fake_consumer.acknowledged[-1][1] == NativeAckType.RELEASE)
+
+        try:
+            client.acknowledge(msg, sgc.AcknowledgeType.RENEW)
+            ok &= check("acknowledge(RENEW) lève NotImplementedError (non supporté côté client Python)", False)
+        except NotImplementedError:
+            ok &= check("acknowledge(RENEW) lève NotImplementedError (non supporté côté client Python)", True)
+
+        client.commit_sync()
+        ok &= check("commit_sync() délègue au ShareConsumer natif", fake_consumer.commits == 1)
+
+        stats = client.get_stats()
+        ok &= check("get_stats() comptabilise 1 ACK et 1 RELEASE", stats.get("acked") == 1 and stats.get("released") == 1)
+
+        client.stop()
+        ok &= check("stop() ferme le ShareConsumer natif", fake_consumer.closed is True)
+
+    return ok
+
+
+# ---------------------------------------------------------------------------
 # Résultat final
 # ---------------------------------------------------------------------------
 
@@ -312,6 +445,7 @@ def main() -> None:
     run_test("Test 3 — Prompts", test_prompts)
     run_test("Test 4 — Flow déterministe (Detection → Decision → Execution)", test_deterministic_flow)
     run_test("Test 5 — ADK factory (sans appel LLM)", test_adk_factory)
+    run_test("Test 6 — ShareGroupClient (ShareConsumer natif mocké)", test_share_group_client)
 
     print("\n" + "=" * 70)
     print("RÉSUMÉ")
