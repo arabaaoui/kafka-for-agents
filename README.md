@@ -3,6 +3,7 @@
 [![Kafka](https://img.shields.io/badge/Kafka-4.2.1-231F20?style=flat-square&logo=apache-kafka)](https://kafka.apache.org/)
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python)](https://www.python.org/)
 [![google-adk](https://img.shields.io/badge/google--adk-%3E%3D2.0-4285F4?style=flat-square)](https://pypi.org/project/google-adk/)
+[![confluent-kafka](https://img.shields.io/badge/confluent--kafka-%3E%3D2.15.0-231F20?style=flat-square)](https://github.com/confluentinc/confluent-kafka-python)
 [![Docker](https://img.shields.io/badge/Docker-Compose%20v2-2496ED?style=flat-square&logo=docker)](https://docs.docker.com/compose/)
 
 A proof-of-concept demonstrating how **Apache Kafka can serve as a native platform for AI agents** — three real [google-adk](https://pypi.org/project/google-adk/) agents, each free to run a different LLM provider, cooperating over Kafka topics to run a retail replenishment pipeline end to end.
@@ -194,12 +195,11 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant SG as ShareGroupClient (KIP-932)
+    participant SG as ShareGroupClient (native ShareConsumer, KIP-932)
     participant P as Python loop
     participant A as ADK Agent (EXECUTION_LLM)
 
-    SG->>P: poll() → acquired task (locked)
-    P->>SG: acknowledge(RENEW) — extend lock immediately
+    SG->>P: poll() → acquired task batch (broker-locked)
     alt EXECUTION_LLM_API_KEY set
         P->>A: run_prompt(task json)
         A->>A: execute_transfer() or execute_order() [tool]
@@ -208,10 +208,11 @@ sequenceDiagram
         P->>P: deterministic_execute() — fixed 2s, always succeeds
     end
     alt success
-        P->>SG: acknowledge(ACK)
+        P->>SG: acknowledge(ACK) — mapped to AcknowledgeType.ACCEPT
     else failure
-        P->>P: no ack — lock expires, message redelivered
+        P->>SG: acknowledge(RELEASE) — immediate redelivery, no lock renewal available
     end
+    P->>SG: commit_sync() — flushes pending acks to the broker
 ```
 
 ---
@@ -234,51 +235,22 @@ The Decision Agent's behavior is driven by a plain-text [`SKILL.md`](skills/supp
 
 ### 3. KIP-932 Share Groups — Cooperative Consumption with ACK/Retry
 
-> **⚠️ Important — Why this PoC emulates KIP-932 instead of using the native `ShareConsumer`**
->
-> `confluent-kafka-python` **2.15.0** (released 2026) ships a `ShareConsumer` class in **Preview** mode that exposes KIP-932 natively.
-> This PoC nevertheless uses an **application-layer emulator** ([`share_group_client.py`](agents/common/share_group_client.py)) instead.
-> Here is why.
+Execution agents consume the `tasks` topic using [KIP-932](https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka) share group semantics, via the **native `ShareConsumer`** shipped in `confluent-kafka-python` **2.15.0 (Preview)**. [`share_group_client.py`](agents/common/share_group_client.py) is now a thin wrapper around it — the KIP-932 state machine (per-record acquisition locks, delivery counting, lock-expiry redelivery) lives entirely broker-side, not in application code:
 
-Execution agents consume the `tasks` topic using [KIP-932](https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka) share group semantics. [`share_group_client.py`](agents/common/share_group_client.py) wraps a standard `Consumer` with an **application-layer emulation** of the KIP-932 state machine — per-message locks, ACK/RENEW/RELEASE lifecycle, lock expiry, and dead-letter after max delivery attempts:
+- **Cooperative consumption**: the broker's share-group coordinator hands out individual records — not partitions — to whichever consumer in the group polls next, so tasks aren't processed by two agents simultaneously
+- **Explicit ACK-based delivery**: the wrapper runs in `share.acknowledgement.mode=explicit`; a task is only marked complete when the agent calls `acknowledge(ACK)` (mapped to `AcknowledgeType.ACCEPT`), flushed to the broker via `commit_sync()`
+- **Auto-reassignment**: if an agent crashes without acknowledging, the broker-side lock expires (`group.share.record.lock.duration.ms`, 30s default) and the record becomes available again for any agent in the group
+- **Dead-letter**: after `group.share.delivery.count.limit` failed deliveries (default 5), the broker stops redelivering the record
+- **Linear scalability**: `docker compose up -d --scale execution-agent=N` — new agents join the share group and immediately start receiving records
 
-- **Cooperative consumption**: partitions are distributed by Kafka's native consumer group protocol; the emulation adds per-message locking on top so tasks aren't processed by two agents simultaneously
-- **ACK-based delivery**: tasks are only marked complete when the agent calls `acknowledge(ACK)` — the standard consumer offset is committed only then
-- **Auto-reassignment**: if an agent crashes without ACKing, the lock expires (30s default) and the message becomes `AVAILABLE` again for any agent in the group
-- **Dead-letter**: after `max_delivery_attempts` failed deliveries, the task is silently dropped with a log warning
-- **Linear scalability**: `docker compose up -d --scale execution-agent=N` — new agents join the consumer group and immediately receive partitions
+#### `RENEW` is not available in the Python client
 
-#### Obstacles to using the native `ShareConsumer` today
+The native Java `KafkaShareConsumer` exposes `acknowledge(record, AcknowledgeType.RENEW)` to extend a record's acquisition lock while a long-running operation (e.g. an LLM call taking 5–15 seconds) is in flight. The Python `ShareConsumer` (2.15.0 Preview) only exposes `ACCEPT`, `RELEASE`, and `REJECT` — the official docs state lock renewal "is not yet available" client-side. [`share_group_client.py`](agents/common/share_group_client.py) raises `NotImplementedError` if `AcknowledgeType.RENEW` is requested, rather than silently doing nothing.
 
-Two concrete blockers prevent adopting the native Python `ShareConsumer` (v2.15.0 Preview) in this PoC right now:
+This PoC works around the gap two ways (see [`execution/agent.py`](agents/execution/agent.py)):
 
-**A. Missing `RENEW` action in the Python client — the LLM lock problem**
-
-In the native Java `KafkaShareConsumer`, you can call `acknowledge(record, AcknowledgeType.RENEW)` to extend the acquisition lock while a long-running operation (e.g. an LLM call taking 5–15 seconds) is in flight. The Python `ShareConsumer` (2.15.0 Preview) only exposes `ACCEPT` (ACK) and `RELEASE`/`REJECT` — there is no way to renew a lock dynamically from Python.
-
-- **Risk**: if the LLM is slow, the broker-side lock expires before the agent finishes responding, triggering a **duplicate execution** of the task by another agent.
-- **Workaround**: set an arbitrarily long lock duration (e.g. 60s) at the broker level — but this delays recovery in case of a real crash, defeating the purpose of cooperative consumption.
-
-**B. librdkafka binary wheels and build time**
-
-The Python client is a C wrapper around `librdkafka`. Preview releases like 2.15.0 don't always ship pre-compiled wheels for every architecture (notably Apple Silicon M1/M2/M3 and ARM64 Linux). Without a wheel, `pip install` falls back to compiling `librdkafka` from source — requiring `gcc`, `g++`, `make` and adding 10–15 minutes to the Docker build.
-
-#### Consequences of switching to the native `ShareConsumer`
-
-| | Impact |
-|---|---|
-| ✅ **Zero emulation code** | Delete `share_group_client.py` and the local JSON persistence files (`/tmp/share-group-*.json`) |
-| ✅ **Protocol fidelity** | The PoC exercises the real KIP-932 network protocol, not an approximation |
-| ✅ **Distributed state** | Delivery state lives in the broker's memory, not on the container's local disk — survives container recreation |
-| ❌ **Loss of cloud portability** | Most managed Kafka services (AWS MSK, Confluent Cloud, Aiven) haven't enabled share groups in production yet — the PoC would be strictly limited to a local Kafka 4.2+ Docker setup |
-| ❌ **API instability** | The `ShareConsumer` interface is in Preview — minor version bumps of `confluent-kafka` may break the API without notice |
-| ❌ **Offline testing breaks** | The deterministic test suite (`test_deterministic_flow.py`) runs without any Docker container. `ShareConsumer` opens native C sockets via `librdkafka` at instantiation — making it impossible to test offline without heavy mocking of the C library |
-
-#### Conclusion
-
-This PoC is a **demonstration and learning tool**. Its goal is to show how three AI agents cooperate over Kafka using KIP-932 semantics — anywhere, including offline on a laptop. Until `confluent-kafka-python` reaches **GA** for the `ShareConsumer` (with `RENEW` support), the emulator reproduces the KIP-932 lifecycle faithfully: `AVAILABLE → ACQUIRED → ACKNOWLEDGED`, lock expiry, delivery counting, and dead-letter — without the build, cloud, and testing constraints of the Preview native client.
-
-The public API (`poll()`, `acknowledge()`, `release()`) is designed to mirror the native `ShareConsumer`, so the swap will be a drop-in replacement when the time comes.
+- **On failure, `RELEASE` immediately** instead of waiting for the lock to expire — the task is redelivered right away rather than after a full 30s timeout.
+- **Keep processing under the lock duration** where possible, and raise `group.share.record.lock.duration.ms` at the broker level (via `SHARE_GROUP_LOCK_DURATION_MS` in `.env`) for deployments where execution is expected to run long (e.g. a slow LLM call) — trading off slower crash recovery for headroom against duplicate execution.
 
 ---
 
@@ -475,7 +447,7 @@ kafka-retail-agents-poc/
     ├── common/
     │   ├── config.py                 # Env-driven config, 3 LLM blocks
     │   ├── adk_factory.py            # LiteLLM-backed google-adk Agent factory + runner
-    │   ├── share_group_client.py     # KIP-932 emulator (ACK/RENEW/RELEASE, dead-letter)
+    │   ├── share_group_client.py     # Wraps the native KIP-932 ShareConsumer (ACK/RELEASE/REJECT)
     │   └── requirements.txt
     ├── simulator/
     │   └── app.py                    # Synthetic stock/order generator (no LLM)
@@ -507,8 +479,8 @@ kafka-retail-agents-poc/
 | `EXECUTION_LLM_API_KEY` | No | *(empty)* | Leave empty for deterministic execution (fixed 2s, 100% success) |
 | `KAFKA_BOOTSTRAP_SERVERS` | No | `kafka:9092` | Kafka broker address |
 | `MCP_CONFLUENT_URL` | No | `http://mcp-confluent:3000` | MCP Confluent HTTP endpoint |
-| `SHARE_GROUP_LOCK_DURATION_MS` | No | `30000` | KIP-932 lock duration before a task is redelivered |
-| `SHARE_GROUP_MAX_DELIVERY_ATTEMPTS` | No | `5` | Attempts before a task is dead-lettered |
+| `SHARE_GROUP_LOCK_DURATION_MS` | No | `30000` | Broker setting (`group.share.record.lock.duration.ms`) — lock duration before a task is redelivered. Not configurable client-side |
+| `SHARE_GROUP_DELIVERY_COUNT_LIMIT` | No | `5` | Broker setting (`group.share.delivery.count.limit`) — attempts before a task stops being redelivered |
 | `SIMULATION_SPEED` | No | `1.0` | `1.0` = real-time, `60.0` = 1h of data in 1 minute |
 | `STOCK_ALERT_THRESHOLD_RATIO` | No | `1.0` | Ratio applied to each product's `seuil_min` to decide when it's an anomaly. `1.0` = alert exactly at `seuil_min`, `0.8` = alert only once stock < 80% of `seuil_min` |
 
@@ -518,6 +490,7 @@ kafka-retail-agents-poc/
 
 - **Docker** 24+ (with Docker Compose v2)
 - **Python 3.11** (for local development; not required for Docker-only usage)
+- **`confluent-kafka` >= 2.15.0** — ships the native `ShareConsumer` (Preview) used for KIP-932; pinned in [`agents/common/requirements.txt`](agents/common/requirements.txt)
 - **Two LLM API keys minimum** (Detection + Decision) — any of OpenAI, Anthropic, or Gemini
 - **~4 GB RAM** available for the full stack
 
