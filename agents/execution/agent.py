@@ -1,8 +1,11 @@
 """
-Execution Agent — Polls the 'tasks' topic via ShareGroupClient and executes tasks.
+Execution Agent — Polls the 'tasks' topic via a native KIP-932 ShareConsumer
+(agents/common/share_group_client.py) and executes tasks.
 
-Uses KIP-932 share group semantics: messages are locked when acquired,
-acknowledged on success, and automatically retried on failure (lock expiry).
+Messages are acquired with a broker-side lock, acknowledged (ACCEPT) on
+success, and RELEASEd for immediate redelivery on failure. There is no
+lock-renewal call in the native Python client (see share_group_client.py),
+so a failed task is released right away rather than left to expire.
 
 The execution LLM is OPTIONAL. If EXECUTION_LLM_API_KEY is empty, no ADK agent
 is ever instantiated: execution is fully deterministic — a fixed 2s delay and
@@ -24,7 +27,6 @@ from common.config import (
     KAFKA_BOOTSTRAP_SERVERS,
     TOPIC_TASKS,
     SHARE_GROUP_LOCK_DURATION_MS,
-    SHARE_GROUP_MAX_DELIVERY_ATTEMPTS,
     EXECUTION_LLM_PROVIDER,
     EXECUTION_LLM_MODEL,
     EXECUTION_LLM_API_KEY,
@@ -139,13 +141,13 @@ def process_task(client: ShareGroupClient, task_msg, agent_runner: AdkAgentRunne
             f"Task acquired: {task_id} "
             f"action={task.get('action')} "
             f"product={task.get('product_id')} "
-            f"qty={task.get('quantite')}"
+            f"qty={task.get('quantite')} "
+            f"delivery_count={task_msg.delivery_count}"
         )
 
-        # Renew the lock immediately: execution duration is unpredictable when
-        # an LLM is in the loop, unlike a fixed deterministic delay.
-        client.acknowledge(task_msg, AcknowledgeType.RENEW)
-
+        # No lock-renewal call exists in the native Python ShareConsumer (see
+        # share_group_client.py), so we just run the task and ACK/RELEASE
+        # based on the outcome — no attempt to extend the lock mid-flight.
         if agent_runner is not None:
             result = run_with_llm(agent_runner, tools, task)
         else:
@@ -156,10 +158,8 @@ def process_task(client: ShareGroupClient, task_msg, agent_runner: AdkAgentRunne
             logger.info(f"Task {task_id}: ACK — completed successfully ({result.get('delay_s')}s)")
             return True
         else:
-            logger.warning(
-                f"Task {task_id}: FAILED — not acknowledging, "
-                f"lock will expire and message will be retried"
-            )
+            client.acknowledge(task_msg, AcknowledgeType.RELEASE)
+            logger.warning(f"Task {task_id}: FAILED — released for immediate redelivery")
             return False
 
     except json.JSONDecodeError as e:
@@ -168,6 +168,7 @@ def process_task(client: ShareGroupClient, task_msg, agent_runner: AdkAgentRunne
         return True
     except Exception as e:
         logger.error(f"Task {task_id}: unexpected error — {e}")
+        client.acknowledge(task_msg, AcknowledgeType.RELEASE)
         return False
 
 
@@ -181,7 +182,6 @@ def main():
         topics=[TOPIC_TASKS],
         consumer_id=consumer_id,
         lock_duration_ms=SHARE_GROUP_LOCK_DURATION_MS,
-        max_delivery_attempts=SHARE_GROUP_MAX_DELIVERY_ATTEMPTS,
     )
 
     agent_runner = None
@@ -210,6 +210,12 @@ def main():
 
             for msg in messages:
                 process_task(client, msg, agent_runner, tools)
+
+            if messages:
+                # Explicit ack mode requires every message from this poll() to
+                # be acknowledged (ACK/RELEASE, above) before the next poll();
+                # commit_sync() flushes those acknowledgements to the broker.
+                client.commit_sync()
 
             time.sleep(0.5)
 
