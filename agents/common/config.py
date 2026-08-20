@@ -36,7 +36,10 @@ EXECUTION_LLM_PROVIDER = os.getenv("EXECUTION_LLM_PROVIDER", "")
 EXECUTION_LLM_MODEL = os.getenv("EXECUTION_LLM_MODEL", "")
 EXECUTION_LLM_API_KEY = os.getenv("EXECUTION_LLM_API_KEY", "")
 
-# Share Group — broker-side settings (informative, applied in docker-compose.yml)
+# Share Group (KIP-932) — both values are broker/group settings now that the
+# native ShareConsumer is used. They are not passed to the Python client;
+# they're read here only to log them and to feed the broker config in
+# docker-compose.yml (group.share.record.lock.duration.ms / group.share.delivery.count.limit).
 SHARE_GROUP_LOCK_DURATION_MS = int(os.getenv("SHARE_GROUP_LOCK_DURATION_MS", "30000"))
 SHARE_GROUP_DELIVERY_COUNT_LIMIT = int(os.getenv("SHARE_GROUP_DELIVERY_COUNT_LIMIT", "5"))
 
