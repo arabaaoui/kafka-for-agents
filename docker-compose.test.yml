@@ -25,6 +25,12 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # KIP-932 share groups (used by execution-agent via the native ShareConsumer).
+      # Enabled by default from Kafka 4.2.0, set explicitly here for clarity.
+      KAFKA_GROUP_COORDINATOR_REBALANCE_PROTOCOLS: classic,consumer,share
+      KAFKA_GROUP_SHARE_ENABLE: "true"
+      KAFKA_GROUP_SHARE_RECORD_LOCK_DURATION_MS: ${SHARE_GROUP_LOCK_DURATION_MS:-30000}
+      KAFKA_GROUP_SHARE_DELIVERY_COUNT_LIMIT: ${SHARE_GROUP_DELIVERY_COUNT_LIMIT:-5}
     volumes:
       - kafka-test-data:/var/lib/kafka/data
     healthcheck:
