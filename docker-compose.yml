@@ -70,22 +70,30 @@ services:
         echo "Topics ready."
 
   # ===========================================================================
-  # MCP Confluent — Standalone MCP server exposing Kafka tools to LLMs
+  # MCP Confluent — Official @confluentinc/mcp-confluent server (HTTP on :3000)
+  # Exposes Kafka tools to LLMs: consume-messages, list-topics, get-topic-config,
+  # get-consumer-group-lag, etc. Agents call it at http://mcp-confluent:3000/mcp.
   # ===========================================================================
   mcp-confluent:
-    build:
-      context: ./mcp-confluent
+    image: node:22-slim
     container_name: mcp-confluent
     ports:
       - "3005:3000"
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      MCP_PORT: "3000"
+    volumes:
+      - ./mcp-confluent/config.yaml:/etc/mcp/config.yaml:ro
+    command: ["npx", "-y", "@confluentinc/mcp-confluent", "--config", "/etc/mcp/config.yaml"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get({port:3000,host:'localhost',timeout:2000},r=>{r.resume();process.exit(0)}).on('error',()=>process.exit(1)).on('timeout',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
     depends_on:
       kafka:
         condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
+    restart: unless-stopped
 
   # ===========================================================================
   # Simulator — Generates synthetic retail data (orders + stock levels)
@@ -122,7 +130,7 @@ services:
       STOCK_ALERT_THRESHOLD_RATIO: ${STOCK_ALERT_THRESHOLD_RATIO:-1.0}
     depends_on:
       mcp-confluent:
-        condition: service_started
+        condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
     restart: unless-stopped
