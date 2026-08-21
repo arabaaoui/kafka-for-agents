@@ -223,7 +223,13 @@ This PoC is built around three key Kafka capabilities that make it an ideal plat
 
 ### 1. MCP Confluent — LLMs Query Kafka Natively
 
-The [MCP Confluent](https://github.com/confluentinc/mcp-confluent) bridge exposes Kafka as a tool that LLMs can call directly (`consume-messages`, `list-topics`, `get-topic-config`, `get-consumer-group-lag`). The Detection Agent calls it through its `call_mcp` ADK tool — no custom API layer, the agent talks the same Kafka protocol as everything else.
+This PoC uses the official [`@confluentinc/mcp-confluent`](https://github.com/confluentinc/mcp-confluent) npm package — **no custom MCP server**. It runs via `npx` in a `node:22-slim` container, configured by [`mcp-confluent/config.yaml`](mcp-confluent/config.yaml) to point at the local Kafka broker (`kafka:9092`, PLAINTEXT, no auth). It exposes a rich Kafka toolset that LLMs can call directly:
+
+- `consume-messages` — with `start: {offset: N}`, `{timestamp: ...}`, or `{tail: N}` for offset seeking (poison-message replay scenarios)
+- `get-consumer-group-lag` — **real per-partition lag** (log-end vs committed-offset), not just group metadata
+- `list-topics`, `get-topic-config`, `list-consumer-groups`, `describe-consumer-group`, `produce-message`, and more
+
+The Detection Agent calls these tools through its `call_mcp` ADK tool over HTTP JSON-RPC at `http://mcp-confluent:3000/mcp` — no custom API layer, the agent talks the same Kafka protocol as everything else.
 
 ### 2. Agent Skills — Business Logic via SKILL.md
 
@@ -437,9 +443,7 @@ kafka-retail-agents-poc/
 │   └── supply-chain-replenishment/
 │       └── SKILL.md                  # Business rules (Agent Skill) — Decision Agent
 ├── mcp-confluent/
-│   ├── Dockerfile
-│   ├── package.json
-│   └── server.js                     # MCP server exposing Kafka tools (KafkaJS)
+│   └── config.yaml                   # Official @confluentinc/mcp-confluent config (local Kafka)
 ├── tests/
 │   └── test_deterministic_flow.py    # Local test of the deterministic flow, no Docker/LLM
 └── agents/
